@@ -372,7 +372,7 @@ def main():
         return
 
     processed_count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=150) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
         futures = {executor.submit(process_and_save, domain): domain for domain in domains_to_scan}
 
         for future in concurrent.futures.as_completed(futures):
