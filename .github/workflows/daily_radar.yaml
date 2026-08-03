@@ -1,37 +1,77 @@
 name: 🚀 Bawa Cloud Engine Auto-Pilot
 
-# Yeh set karta hai ki script roz subah 2:00 AM (UTC) par chalegi
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch: # Yeh aapko manually button daba kar script run karne ki power deta hai
+    - cron: '0 2 * * *'   # roz subah 2:00 AM UTC
+  workflow_dispatch:      # manual "Run workflow" button
+
+permissions:
+  contents: write   # zaroori hai final leads ko wapas commit karne ke liye
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 340   # ~5h40m — GitHub Actions ki 6hr hard-limit se pehle hi khatam ho jaaye
 
     steps:
-    - name: 📥 Checkout Repository
-      uses: actions/checkout@v4
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: 🐍 Setup Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: 🐍 Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: 📦 Install Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: 📦 Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: 🔥 Fire The Master Controller
-      env:
-        GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      run: |
-        python master_controller.py
+      # 🧠 Pipeline ki working state (scanned_cache.txt, filter_2.done, raw whois
+      # downloads waghera) fresh checkout ke saath khatam ho jaati — is cache ke
+      # bina resume-logic ka koi matlab nahi rehta.
+      - name: ♻️ Restore pipeline state cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            state
+            daily_domains
+          key: pipeline-state-${{ github.run_id }}
+          restore-keys: |
+            pipeline-state-
 
-    - name: 💾 Save Final VIP Leads as Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: VIP_Leads_Archive
-        path: master_control_room/*.csv
+      - name: 🔥 Fire The Master Controller
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Optional override — default already set inside 3_lead_categorizer.py
+          # GROQ_MODEL: "llama-3.3-70b-versatile"
+          MAX_RUNTIME_SECONDS: "19800"   # 5.5h budget for the pipeline loop itself
+        run: |
+          python master_controller.py
+
+      # 📌 Final VIP leads ko repo me hi commit-back karo taaki har din ka
+      # record git history me permanently accumulate ho — Actions artifacts
+      # sirf 90 din tak hi rehte hai.
+      # ⚠️  PRIVACY: master_control_room CSVs me scraped emails/phones hote hain.
+      #     Agar repo public hai, isko private rakhna consider karo, ya niche
+      #     wala commit-back step hata ke sirf artifact upload pe rely karo.
+      - name: 💾 Commit Final Leads Back to Repo
+        if: always()
+        run: |
+          git config user.name "bawa-leads-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add master_control_room/ || true
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 Auto-update: leads for $(date -u +'%Y-%m-%d')"
+            git push
+          else
+            echo "Koi naya final CSV nahi bana is run me — kuch commit karne ko nahi hai."
+          fi
+
+      - name: 📤 Upload Final VIP Leads as Artifact
+        if: always()   # pipeline beech me fail/timeout ho jaaye tab bhi jo bana wo save ho
+        uses: actions/upload-artifact@v4
+        with:
+          name: VIP_Leads_Archive
+          path: master_control_room/*.csv
+          if-no-files-found: warn
