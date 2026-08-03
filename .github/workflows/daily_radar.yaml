@@ -6,7 +6,7 @@ on:
   workflow_dispatch:      # manual "Run workflow" button
 
 permissions:
-  contents: write   # zaroori hai final leads ko wapas commit karne ke liye
+  contents: write   # zaroori hai raw + final data ko wapas commit karne ke liye
 
 jobs:
   run-pipeline:
@@ -27,15 +27,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🧠 Pipeline ki working state (scanned_cache.txt, filter_2.done, raw whois
-      # downloads waghera) fresh checkout ke saath khatam ho jaati — is cache ke
-      # bina resume-logic ka koi matlab nahi rehta.
-      - name: ♻️ Restore pipeline state cache
+      # 🧠 Sirf beech-ki-scratch working state (ek date ke process hone
+      # tak zinda rehne wali files) cache me rakhte hai — taaki agar job
+      # timeout ho jaaye toh next run wahi se resume kar sake.
+      - name: ♻️ Restore in-progress state cache
         uses: actions/cache@v4
         with:
-          path: |
-            state
-            daily_domains
+          path: state
           key: pipeline-state-${{ github.run_id }}
           restore-keys: |
             pipeline-state-
@@ -43,29 +41,29 @@ jobs:
       - name: 🔥 Fire The Master Controller
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          # Optional override — default already set inside 3_lead_categorizer.py
-          # GROQ_MODEL: "llama-3.3-70b-versatile"
           MAX_RUNTIME_SECONDS: "19800"   # 5.5h budget for the pipeline loop itself
         run: |
           python master_controller.py
 
-      # 📌 Final VIP leads ko repo me hi commit-back karo taaki har din ka
-      # record git history me permanently accumulate ho — Actions artifacts
-      # sirf 90 din tak hi rehte hai.
-      # ⚠️  PRIVACY: master_control_room CSVs me scraped emails/phones hote hain.
-      #     Agar repo public hai, isko private rakhna consider karo, ya niche
-      #     wala commit-back step hata ke sirf artifact upload pe rely karo.
-      - name: 💾 Commit Final Leads Back to Repo
+      # 📌 Dono cheezein permanently git me commit-back karo — jaisa
+      # original PC-wale design me hota tha:
+      #   1. daily_domains/         → raw whois data, date-wise
+      #   2. master_control_room/   → final categorized leads, date-wise
+      # Yahi ab tera permanent storage hai — GitHub pe hamesha available
+      # rahega, kahin se bhi (browser/git) access ho sakta hai.
+      # ⚠️ PRIVACY: master_control_room CSVs me scraped emails/phones hote
+      #     hain. Agar repo public hai, ise PRIVATE rakhna consider karo.
+      - name: 💾 Commit Raw + Final Data Back to Repo
         if: always()
         run: |
           git config user.name "bawa-leads-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add master_control_room/ || true
+          git add daily_domains/ master_control_room/ || true
           if ! git diff --cached --quiet; then
-            git commit -m "🤖 Auto-update: leads for $(date -u +'%Y-%m-%d')"
+            git commit -m "🤖 Auto-update: raw + processed leads for $(date -u +'%Y-%m-%d')"
             git push
           else
-            echo "Koi naya final CSV nahi bana is run me — kuch commit karne ko nahi hai."
+            echo "Koi naya data nahi bana is run me — kuch commit karne ko nahi hai."
           fi
 
       - name: 📤 Upload Final VIP Leads as Artifact
