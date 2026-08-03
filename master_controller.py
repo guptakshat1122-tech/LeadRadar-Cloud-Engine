@@ -99,13 +99,11 @@ def fire_the_pipeline(target_date_str, is_resume=False):
     with open(date_lock_file, "w") as f:
         f.write(target_date_str)
 
-    # ---------------- STEP 1: SNIPER ----------------
+    # ---------------- STEP 1: SNIPER (full historical sync, like original PC design) ----------------
     if not is_resume:
-        log("STEP 1: Firing Sniper...")
+        log("STEP 1: Firing Sniper (checking ALL missing historical dates on WhoisDS)...")
         try:
-            subprocess.run([PYTHON, SNIPER_SCRIPT, target_date_str], check=True, cwd=BASE_DIR, timeout=1800)
-        except subprocess.CalledProcessError:
-            return "MISSING"
+            subprocess.run([PYTHON, SNIPER_SCRIPT], check=True, cwd=BASE_DIR, timeout=1800)
         except subprocess.TimeoutExpired:
             log("Sniper timed out.")
             return "ERROR"
