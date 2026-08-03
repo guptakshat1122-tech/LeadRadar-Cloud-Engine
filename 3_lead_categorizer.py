@@ -7,14 +7,15 @@ import requests
 import re
 
 # ==========================================
-# ⚙️ CONFIGURATION
+# ⚙️ CONFIGURATION — ab Groq cloud API use karta hai (koi local Ollama nahi chahiye)
 # ==========================================
-INPUT_FILE  = 'Ultimate_God_Leads.csv'
-OUTPUT_FILE = 'Bawa_Categorized_Leads.csv'
-OLLAMA_URL  = "http://localhost:11434/api/generate"
-MODEL_NAME  = "qwen2.5:7b"
-BATCH_SIZE  = 2
-MAX_RETRIES = 3
+INPUT_FILE   = 'Ultimate_God_Leads.csv'
+OUTPUT_FILE  = 'Bawa_Categorized_Leads.csv'
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+MODEL_NAME   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+BATCH_SIZE   = 5          # Groq cloud fast hai, Ollama jaisa 2 rakhne ki zaroorat nahi
+MAX_RETRIES  = 3
 
 stats = {"processed": 0, "auto_done": 0, "ai_skipped": 0, "retries": 0}
 
@@ -33,7 +34,6 @@ def extract_content(text, domain=""):
         return ""
     text = text.encode("utf-8", errors="ignore").decode("utf-8")
     text = "".join(c for c in text if c.isprintable() and ord(c) < 65536)
-    # Non-english? Still try — keep ascii words only
     domain_root = re.sub(r'[^a-z0-9]', '', domain.split(".")[0].lower()) if domain else ""
     words = re.findall(r'[a-zA-Z]{3,}', text)
     seen = {}
@@ -78,27 +78,16 @@ def has_no_content(lead):
     title = clean_field(lead.get("Title",""))
     meta  = clean_field(lead.get("Meta_Description",""))
     cont  = extract_content(lead.get("Page_Text",""), lead.get("Domain",""))
-    # Must have at least 10 chars of useful content
     return len(title + meta + cont) < 10
 
 # ==========================================
 # 🔧 CATEGORY NORMALIZER
 # ==========================================
-VALID_CATS = [
-    ("🔥 1. Pre-Launch",         ["pre-launch", "prelaunch", "pre launch"]),
-    ("🤖 2. SaaS/Tech",          ["saas", "tech", "software", "app", "platform", "tool", "api"]),
-    ("💰 3. D2C Ad Spenders",    ["d2c", "ecommerce", "e-commerce", "shop", "store", "product"]),
-    ("🎬 4. Video-First Brands", ["video", "film", "media", "youtube", "studio", "production"]),
-    ("🛠️ 5. Service Agencies",   ["service", "agency", "agenc", "consult", "freelanc"]),
-    ("🟢 6. General Contacts",   ["general", "contact"]),
-]
-
 def normalize_category(pitch, domain="", biz="", prod=""):
     """Fix malformed categories — replace (NICHE) with actual industry, fix wrong emojis."""
     if not pitch:
         return "🟢 6. General Contacts"
 
-    # Fix wrong emojis AI kabhi kabhi deta hai
     EMOJI_FIX = {
         "🍺": "🎬", "📝": "🛠️", "🎥": "🎬", "📱": "🤖",
         "💻": "🤖", "🏥": "🛠️", "🍔": "🛠️", "🏠": "🛠️",
@@ -108,21 +97,17 @@ def normalize_category(pitch, domain="", biz="", prod=""):
         if pitch.startswith(wrong):
             pitch = right + pitch[len(wrong):]
 
-    # Fix invented category names
-    import re as _re
     pitch_lower = pitch.lower()
     INVENTED = ["author", "blogger", "writer", "poet"]
     for inv in INVENTED:
         if pitch_lower.startswith(inv) or f" {inv}" in pitch_lower[:15]:
-            niche_match = _re.search(r"\(.*?\)", pitch)
+            niche_match = re.search(r"\(.*?\)", pitch)
             niche = niche_match.group(0) if niche_match else ""
             pitch = f"🛠️ 5. Service Agencies {niche}".strip()
             break
 
-    # If NICHE literally still there — try to fix from biz/prod
     if "(NICHE)" in pitch or "(niche)" in pitch.lower():
         hint = (biz + " " + prod).lower()
-        # Common industry detection
         if any(x in hint for x in ["health", "medical", "clinic", "doctor", "pharma", "dental"]):
             niche = "Healthcare"
         elif any(x in hint for x in ["fitness", "gym", "sport", "athlet", "workout"]):
@@ -152,21 +137,9 @@ def normalize_category(pitch, domain="", biz="", prod=""):
     return pitch
 
 # ==========================================
-# 🧠 AI CATEGORIZER
+# 🧠 AI CATEGORIZER — Groq cloud (OpenAI-compatible) API
 # ==========================================
-def categorize_batch_with_ai(batch_leads, attempt=1):
-    batch_data = [
-        {
-            "index":   i,
-            "domain":  l.get("Domain", ""),
-            "title":   clean_field(l.get("Title",""), 150),
-            "meta":    clean_field(l.get("Meta_Description",""), 300),
-            "content": extract_content(l.get("Page_Text",""), l.get("Domain",""))
-        }
-        for i, l in enumerate(batch_leads)
-    ]
-
-    prompt = f"""You are a business analyst. Read each website's text and categorize it.
+SYSTEM_PROMPT = """You are a business analyst. Read each website's text and categorize it.
 
 Use ALL text signals: title, meta description, and content keywords.
 Even if content is short, make your best guess from domain name + title + meta.
@@ -191,24 +164,50 @@ RULES:
 - If content is foreign language, use domain+title to guess
 - Return items in SAME ORDER as input using "index"
 
-Return ONLY raw JSON array:
-[{{"index":0,"domain":"x.com","pitch_category":"🛠️ 5. Service Agencies (Healthcare)","true_business_type":"Orthopaedic Clinic","true_product_category":"Joint Replacement Surgery"}}]
+Return ONLY a raw JSON object with this exact shape (no markdown fences, no extra text):
+{"items": [{"index":0,"domain":"x.com","pitch_category":"🛠️ 5. Service Agencies (Healthcare)","true_business_type":"Orthopaedic Clinic","true_product_category":"Joint Replacement Surgery"}]}
+"""
 
-Websites:
-{json.dumps(batch_data, indent=2)}"""
+def categorize_batch_with_ai(batch_leads, attempt=1):
+    batch_data = [
+        {
+            "index":   i,
+            "domain":  l.get("Domain", ""),
+            "title":   clean_field(l.get("Title",""), 150),
+            "meta":    clean_field(l.get("Meta_Description",""), 300),
+            "content": extract_content(l.get("Page_Text",""), l.get("Domain",""))
+        }
+        for i, l in enumerate(batch_leads)
+    ]
+
+    user_prompt = f"Websites:\n{json.dumps(batch_data, indent=2)}"
 
     payload = {
         "model": MODEL_NAME,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.05, "num_predict": 3500}
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.05,
+        "max_tokens": 3500,
+        "response_format": {"type": "json_object"}
+    }
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
     }
 
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        response = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=90)
+
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 15))
+            print(f"   ⏳ Rate limited by Groq — waiting {retry_after}s...")
+            time.sleep(retry_after)
+            return "RATE_LIMITED"
+
         response.raise_for_status()
-        raw = response.json().get("response", "").strip()
+        raw = response.json()["choices"][0]["message"]["content"].strip()
 
         if raw.startswith("```"):
             raw = "\n".join(raw.split("\n")[1:-1])
@@ -217,7 +216,7 @@ Websites:
 
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            parsed = next((v for v in parsed.values() if isinstance(v, list)), [parsed])
+            parsed = parsed.get("items") or next((v for v in parsed.values() if isinstance(v, list)), [parsed])
         if not isinstance(parsed, list):
             return "JSON_ERROR"
 
@@ -246,9 +245,12 @@ Websites:
     except requests.exceptions.Timeout:
         print(f"   ⏱️ Timeout (attempt {attempt})")
         return "TIMEOUT"
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
         print(f"   ⚠️ JSON error (attempt {attempt}): {str(e)[:80]}")
         return "JSON_ERROR"
+    except requests.exceptions.HTTPError as e:
+        print(f"   ❌ Groq API HTTP error: {str(e)[:150]}")
+        return "UNKNOWN_ERROR"
     except Exception as e:
         print(f"   ❌ Error: {str(e)[:100]}")
         return "UNKNOWN_ERROR"
@@ -272,10 +274,11 @@ def process_batch_with_retry(batch, batch_num):
         result = categorize_batch_with_ai(batch, attempt)
         if isinstance(result, dict) and "domain_map" in result:
             return result
-        elif result == "CONNECTION_ERROR":
-            print("🛑 Ollama band hai! 30s wait...")
-            time.sleep(30)
+        elif result in ("CONNECTION_ERROR", "RATE_LIMITED"):
             stats["retries"] += 1
+            if result == "CONNECTION_ERROR":
+                print("🛑 Groq se connect nahi ho paaya! 15s wait...")
+                time.sleep(15)
         else:
             stats["retries"] += 1
             if attempt < MAX_RETRIES:
@@ -293,14 +296,11 @@ def process_batch_with_retry(batch, batch_num):
 # ==========================================
 def main():
     print("=" * 60)
-    print("🖥️  [LOCAL AI v7.0] Smart Categorizer — Bawa God Mode")
+    print("☁️  [GROQ CLOUD AI] Smart Categorizer — Bawa God Mode")
     print("=" * 60)
 
-    try:
-        requests.get("http://localhost:11434", timeout=5)
-        print("✅ Ollama: ONLINE")
-    except:
-        print("❌ Ollama band hai! 'ollama serve' run karo.")
+    if not GROQ_API_KEY:
+        print("❌ GROQ_API_KEY set nahi hai! GitHub repo secrets me add karo ya env var set karo.")
         sys.exit(1)
 
     if not os.path.exists(INPUT_FILE):
@@ -342,8 +342,7 @@ def main():
     print(f"🔥 Pre-Launch      : {len(prelaunch)}")
     print(f"🅿️  Parked          : {len(parked)}")
     print(f"⬛ No content       : {len(no_data)}")
-    print(f"🤖 AI to process   : {len(ai_leads)}")
-    print(f"⏱️  Est. time       : ~{max(1,(total_batches * 15) // 60)} min")
+    print(f"🤖 AI to process   : {len(ai_leads)}  (model: {MODEL_NAME})")
     print("-" * 60 + "\n")
 
     start_time = time.time()
@@ -401,9 +400,12 @@ def main():
             eta     = int((elapsed / batch_num) * (total_batches - batch_num))
             print(f"   ✅ ETA: ~{eta//60}m {eta%60}s | Skipped: {stats['ai_skipped']} | Retries: {stats['retries']}")
 
+            # Groq free-tier rate limits ka thoda khayal — batches ke beech chhota sa gap
+            time.sleep(0.5)
+
     total_time = int(time.time() - start_time)
     print("\n" + "=" * 60)
-    print("🎉 v7.0 COMPLETE!")
+    print("🎉 COMPLETE!")
     print("=" * 60)
     print(f"⚡ Instant  : {stats['auto_done']}")
     print(f"🤖 AI done  : {stats['processed']}")
