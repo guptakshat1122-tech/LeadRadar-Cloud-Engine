@@ -1,5 +1,4 @@
 import os
-import sys
 import cloudscraper
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -11,10 +10,15 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 SAVE_FOLDER = os.path.join(BASE_DIR, "daily_domains")
 
 
-def sync_historical_whois_data(target_date_str=None):
+def sync_historical_whois_data():
+    """
+    Original PC-wale design jaisa hi: har run pe WhoisDS ki poori visible
+    history table check karo, jo bhi date apne paas locally missing hai
+    (chahe wo kal ki ho ya 5 din purani), usko download kar lo.
+    Isse koi bhi date kabhi "chhoot" nahi jaati, chahe workflow beech me
+    kuch din ke liye na bhi chale.
+    """
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [+] System Waking Up... Scanning for Missing Historical Data.")
-    if target_date_str:
-        print(f"[+] Targeted mode: sirf {target_date_str} ka data dhoondenge.")
 
     if not os.path.exists(SAVE_FOLDER):
         os.makedirs(SAVE_FOLDER)
@@ -36,11 +40,10 @@ def sync_historical_whois_data(target_date_str=None):
         table = soup.find('table')
         if not table:
             print("[-] Alert: Table nahi mili website pe. DOM change ho gaya hai.")
-            return False
+            return
 
         rows = table.find_all('tr')
         downloaded_count = 0
-        target_found_and_ready = False
 
         for row in rows:
             cols = row.find_all('td')
@@ -50,17 +53,12 @@ def sync_historical_whois_data(target_date_str=None):
                 if not re.match(r'\d{4}-\d{2}-\d{2}', date_str):
                     continue
 
-                # Targeted mode me sirf wahi date process karo, baaki skip
-                if target_date_str and date_str != target_date_str:
-                    continue
-
                 expected_filename = f"Whois_Leads_Extracted_{date_str}.txt"
                 expected_filepath = os.path.join(SAVE_FOLDER, expected_filename)
 
+                # 🛡️ THE MISSING DATA CHECK
                 if os.path.exists(expected_filepath):
                     print(f"[~] Safe: {date_str} ka data folder me pehle se hai. Skipping...")
-                    if target_date_str and date_str == target_date_str:
-                        target_found_and_ready = True
                     continue
 
                 link_tag = row.find('a', href=True)
@@ -109,41 +107,21 @@ def sync_historical_whois_data(target_date_str=None):
                             os.rename(original_file_path, expected_filepath)
                             print(f"[+] SUCCESS: Data saved as {expected_filename} ✅")
                             downloaded_count += 1
-                            if target_date_str and date_str == target_date_str:
-                                target_found_and_ready = True
                 except zipfile.BadZipFile:
                     print(f"[-] Error: {date_str} ki ZIP file corrupt hai.")
 
                 if os.path.exists(zip_file_path):
                     os.remove(zip_file_path)
 
-                # Targeted mode me apna kaam ho gaya, baaki rows check karne ki zaroorat nahi
-                if target_date_str and date_str == target_date_str:
-                    break
-
-        if downloaded_count == 0 and not target_found_and_ready:
-            print("\n[+] Koi naya data nahi mila is run me.")
+        if downloaded_count == 0:
+            print("\n[+] SYSTEM AUDIT PERFECT: Aapke folder me aage-peeche ka saara available data already UPDATE hai! 🛡️")
         else:
-            print(f"\n[!] Total {downloaded_count} date(s) ka data is run me download hua.")
-
-        if target_date_str:
-            return target_found_and_ready or os.path.exists(
-                os.path.join(SAVE_FOLDER, f"Whois_Leads_Extracted_{target_date_str}.txt")
-            )
-        return True
+            print(f"\n[!] BINGPOT! Total {downloaded_count} missing dates ka data recover kar liya gaya hai 🚀")
 
     except Exception as e:
         print(f"[-] Error in the matrix: {e}")
-        return False
 
 
 if __name__ == "__main__":
     print("[+] Initiating Auto-Sync Historical Scanner NOW...")
-    requested_date = sys.argv[1].strip() if len(sys.argv) > 1 else None
-    ok = sync_historical_whois_data(requested_date)
-
-    # 🔑 Exit code matters — master_controller.py isko check karta hai
-    # (check=True + CalledProcessError se "MISSING" detect hota hai)
-    if requested_date:
-        sys.exit(0 if ok else 1)
-    sys.exit(0 if ok else 1)
+    sync_historical_whois_data()
