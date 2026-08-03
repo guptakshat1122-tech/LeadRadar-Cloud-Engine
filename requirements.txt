@@ -1,0 +1,4 @@
+cloudscraper
+beautifulsoup4
+requests
+deep-translator
