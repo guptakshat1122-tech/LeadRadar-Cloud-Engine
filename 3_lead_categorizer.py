@@ -13,7 +13,7 @@ INPUT_FILE   = 'Ultimate_God_Leads.csv'
 OUTPUT_FILE  = 'Bawa_Categorized_Leads.csv'
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL_NAME   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+MODEL_NAME   = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 BATCH_SIZE   = 5          # Groq cloud fast hai, Ollama jaisa 2 rakhne ki zaroorat nahi
 MAX_RETRIES  = 3
 
