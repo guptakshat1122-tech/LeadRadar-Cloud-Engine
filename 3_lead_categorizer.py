@@ -14,11 +14,18 @@ OUTPUT_FILE  = 'Bawa_Categorized_Leads.csv'
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL_NAME   = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+MODEL_NAME   = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 BATCH_SIZE   = 5          # Groq cloud fast hai, Ollama jaisa 2 rakhne ki zaroorat nahi
-MAX_RETRIES  = 3
+MAX_RETRIES  = 3          # sirf REAL errors ke liye (rate-limit alag se handle hota hai)
+MAX_RATE_LIMIT_RETRIES = 8  # rate-limit koi "failure" nahi hai, isliye zyada patience
 
-stats = {"processed": 0, "auto_done": 0, "ai_skipped": 0, "retries": 0}
+# Adaptive spacing — agar rate-limit baar baar lage to batches ke beech gap khud badhega
+BASE_BATCH_SLEEP = 0.5
+MAX_BATCH_SLEEP  = 12.0
+current_batch_sleep = BASE_BATCH_SLEEP
+consecutive_rate_limits = 0
+
+stats = {"processed": 0, "auto_done": 0, "ai_skipped": 0, "retries": 0, "rate_limit_hits": 0, "json_fallback_saved": 0}
 
 NAV_WORDS = {
     "home", "about", "contact", "menu", "toggle", "navigation", "nav",
@@ -273,8 +280,11 @@ def categorize_batch_with_ai(batch_leads, attempt=1):
         response = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=90)
 
         if response.status_code == 429:
+            global consecutive_rate_limits
+            consecutive_rate_limits += 1
+            stats["rate_limit_hits"] += 1
             retry_after = int(response.headers.get("Retry-After", 15))
-            print(f"   ⏳ Rate limited by Groq — waiting {retry_after}s...")
+            print(f"   ⏳ Rate limited by Groq — waiting {retry_after}s... (consecutive: {consecutive_rate_limits})")
             time.sleep(retry_after)
             return "RATE_LIMITED"
 
@@ -338,6 +348,14 @@ def categorize_batch_with_ai(batch_leads, attempt=1):
         print(f"   ❌ Error: {str(e)[:100]}")
         return "UNKNOWN_ERROR"
 
+def categorize_single_lead_fallback(lead):
+    """Jab poora batch ka JSON invalid ho jaaye, ek lead ko akela bhejo —
+    chhota prompt = kam chance of malformed JSON. Sirf ek attempt, koi loop nahi."""
+    result = categorize_batch_with_ai([lead], attempt=1)
+    if isinstance(result, dict) and "domain_map" in result:
+        return get_ai_result(result, lead.get("Domain", ""), 0)
+    return None
+
 # ==========================================
 # 🔁 RETRY WRAPPER
 # ==========================================
@@ -353,26 +371,64 @@ def get_ai_result(mapping, domain, index):
     return DEFAULT
 
 def process_batch_with_retry(batch, batch_num):
-    for attempt in range(1, MAX_RETRIES + 1):
-        result = categorize_batch_with_ai(batch, attempt)
+    global consecutive_rate_limits
+    real_attempt = 0
+    rate_limit_attempt = 0
+
+    while real_attempt < MAX_RETRIES and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
+        result = categorize_batch_with_ai(batch, real_attempt + 1)
+
         if isinstance(result, dict) and "domain_map" in result:
+            consecutive_rate_limits = 0  # success — reset the adaptive backoff
             return result
-        elif result in ("CONNECTION_ERROR", "RATE_LIMITED"):
+
+        elif result == "RATE_LIMITED":
+            # Rate limit is not a real failure — retry with its own budget,
+            # doesn't eat into MAX_RETRIES meant for genuine errors.
+            rate_limit_attempt += 1
             stats["retries"] += 1
-            if result == "CONNECTION_ERROR":
-                print("🛑 Groq se connect nahi ho paaya! 15s wait...")
-                time.sleep(15)
+            continue
+
+        elif result == "CONNECTION_ERROR":
+            real_attempt += 1
+            stats["retries"] += 1
+            print("🛑 Groq se connect nahi ho paaya! 15s wait...")
+            time.sleep(15)
+
         else:
+            real_attempt += 1
             stats["retries"] += 1
-            if attempt < MAX_RETRIES:
-                wait = 5 * attempt
-                print(f"   🔁 Retry {attempt}/{MAX_RETRIES} in {wait}s...")
+            if real_attempt < MAX_RETRIES:
+                wait = 5 * real_attempt
+                print(f"   🔁 Retry {real_attempt}/{MAX_RETRIES} in {wait}s...")
                 time.sleep(wait)
-            else:
-                print(f"   🚫 Batch {batch_num} skip.")
-                stats["ai_skipped"] += len(batch)
-                return None
-    return None
+
+    # ⬇️ NAYA: poora batch skip karne se pehle, ek-ek lead alag se try karo.
+    # JSON-validate-fail jaisa error aksar batch-size ki wajah se hota hai —
+    # single-lead request me chance kam hota hai.
+    print(f"   🧩 Batch {batch_num} ke leads ko individually try kar rahe hain (last resort)...")
+    domain_map, index_map = {}, {}
+    saved = 0
+    for i, lead in enumerate(batch):
+        single_result = categorize_single_lead_fallback(lead)
+        if single_result:
+            domain_map[lead.get("Domain", "")] = single_result
+            index_map[i] = single_result
+            saved += 1
+        time.sleep(0.3)
+
+    if saved > 0:
+        stats["json_fallback_saved"] += saved
+        print(f"   ✅ {saved}/{len(batch)} leads fallback se bach gaye.")
+
+    if saved < len(batch):
+        stats["ai_skipped"] += (len(batch) - saved)
+
+    if saved == 0:
+        print(f"   🚫 Batch {batch_num} fully skip.")
+        return None
+
+    return {"domain_map": domain_map, "index_map": index_map}
 
 # ==========================================
 # 🚀 MAIN
@@ -484,20 +540,28 @@ def main():
             out_f.flush()
             elapsed = time.time() - start_time
             eta     = int((elapsed / batch_num) * (total_batches - batch_num))
-            print(f"   ✅ ETA: ~{eta//60}m {eta%60}s | Skipped: {stats['ai_skipped']} | Retries: {stats['retries']}")
+            print(f"   ✅ ETA: ~{eta//60}m {eta%60}s | Skipped: {stats['ai_skipped']} | Retries: {stats['retries']} | RateLimits: {stats['rate_limit_hits']}")
 
-            # Groq free-tier rate limits ka thoda khayal — batches ke beech chhota sa gap
-            time.sleep(0.5)
+            # ⬇️ NAYA: adaptive spacing — agar rate-limits lagatar lag rahe hain,
+            # to batches ke beech ka gap khud badhao (aur kabhi kam bhi karo jab sab smooth ho).
+            global current_batch_sleep
+            if consecutive_rate_limits >= 2:
+                current_batch_sleep = min(current_batch_sleep * 1.5, MAX_BATCH_SLEEP)
+            elif consecutive_rate_limits == 0 and current_batch_sleep > BASE_BATCH_SLEEP:
+                current_batch_sleep = max(current_batch_sleep * 0.9, BASE_BATCH_SLEEP)
+            time.sleep(current_batch_sleep)
 
     total_time = int(time.time() - start_time)
     print("\n" + "=" * 60)
     print("🎉 COMPLETE!")
     print("=" * 60)
-    print(f"⚡ Instant  : {stats['auto_done']}")
-    print(f"🤖 AI done  : {stats['processed']}")
-    print(f"🚫 Skipped  : {stats['ai_skipped']}")
-    print(f"🔁 Retries  : {stats['retries']}")
-    print(f"⏱️  Time     : {total_time // 60}m {total_time % 60}s")
+    print(f"⚡ Instant       : {stats['auto_done']}")
+    print(f"🤖 AI done       : {stats['processed']}")
+    print(f"🧩 JSON fallback : {stats['json_fallback_saved']} (saved via single-lead retry)")
+    print(f"🚫 Skipped       : {stats['ai_skipped']}")
+    print(f"🔁 Real retries  : {stats['retries']}")
+    print(f"⏳ Rate limits   : {stats['rate_limit_hits']}")
+    print(f"⏱️  Time          : {total_time // 60}m {total_time % 60}s")
     print("=" * 60)
 
 if __name__ == "__main__":
