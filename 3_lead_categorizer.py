@@ -12,6 +12,7 @@ import re
 INPUT_FILE   = 'Ultimate_God_Leads.csv'
 OUTPUT_FILE  = 'Bawa_Categorized_Leads.csv'
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL_NAME   = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 BATCH_SIZE   = 5          # Groq cloud fast hai, Ollama jaisa 2 rakhne ki zaroorat nahi
@@ -137,6 +138,77 @@ def normalize_category(pitch, domain="", biz="", prod=""):
     return pitch
 
 # ==========================================
+# 🩺 STARTUP SANITY CHECK — pehle hi pata chal jaye galti kahan hai
+# ==========================================
+def run_preflight_check():
+    print("🩺 Preflight check chal raha hai...")
+
+    # 1) Key loaded hai ya nahi
+    if not GROQ_API_KEY:
+        print("❌ GROQ_API_KEY khaali hai! Env var / GitHub secret set nahi hua.")
+        sys.exit(1)
+    else:
+        masked = GROQ_API_KEY[:4] + "..." + GROQ_API_KEY[-4:] if len(GROQ_API_KEY) > 8 else "***"
+        print(f"   ✅ GROQ_API_KEY mil gayi (length={len(GROQ_API_KEY)}, {masked})")
+
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+
+    # 2) Key valid hai + model list fetch karke dekho MODEL_NAME available hai ya nahi
+    try:
+        resp = requests.get(GROQ_MODELS_URL, headers=headers, timeout=30)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Groq se connect hi nahi ho paaya: {e}")
+        sys.exit(1)
+
+    if resp.status_code == 401:
+        print("❌ GROQ_API_KEY invalid/expired hai (401 Unauthorized).")
+        print(f"   ↳ Response: {resp.text[:300]}")
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"❌ Model list fetch nahi ho payi — status {resp.status_code}")
+        print(f"   ↳ Response: {resp.text[:300]}")
+        sys.exit(1)
+
+    try:
+        available_models = [m["id"] for m in resp.json().get("data", [])]
+    except Exception as e:
+        print(f"⚠️  Model list parse nahi ho payi: {e}")
+        available_models = []
+
+    print(f"   ✅ API key valid hai. {len(available_models)} models available hain.")
+
+    if available_models and MODEL_NAME not in available_models:
+        print(f"❌ MODEL_NAME '{MODEL_NAME}' Groq ke available models me nahi hai!")
+        print(f"   ↳ Available models: {available_models}")
+        print("   👉 GROQ_MODEL env var ko available list me se koi valid model id set karo.")
+        sys.exit(1)
+    else:
+        print(f"   ✅ Model '{MODEL_NAME}' available hai.")
+
+    # 3) Ek dummy real request bhi maar ke dekho — end-to-end confirm
+    test_payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "Reply with just the word OK."}],
+        "max_tokens": 5
+    }
+    try:
+        test_resp = requests.post(GROQ_API_URL, json=test_payload,
+                                   headers={**headers, "Content-Type": "application/json"},
+                                   timeout=30)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Test chat completion request fail ho gayi: {e}")
+        sys.exit(1)
+
+    if test_resp.status_code != 200:
+        print(f"❌ Test chat completion fail — status {test_resp.status_code}")
+        print(f"   ↳ Response: {test_resp.text[:500]}")
+        sys.exit(1)
+
+    print("   ✅ Test chat completion successful. Sab thik hai, aage badhte hain.\n")
+
+
+# ==========================================
 # 🧠 AI CATEGORIZER — Groq cloud (OpenAI-compatible) API
 # ==========================================
 SYSTEM_PROMPT = """You are a business analyst. Read each website's text and categorize it.
@@ -206,7 +278,13 @@ def categorize_batch_with_ai(batch_leads, attempt=1):
             time.sleep(retry_after)
             return "RATE_LIMITED"
 
-        response.raise_for_status()
+        # ⬇️ NAYA: status non-200 hote hi pehle poora error body dikhao, phir raise karo
+        if response.status_code != 200:
+            print(f"   ❌ Groq API HTTP error: status={response.status_code}")
+            print(f"   ↳ URL: {response.url}")
+            print(f"   ↳ Body: {response.text[:500]}")
+            response.raise_for_status()
+
         raw = response.json()["choices"][0]["message"]["content"].strip()
 
         if raw.startswith("```"):
@@ -247,9 +325,14 @@ def categorize_batch_with_ai(batch_leads, attempt=1):
         return "TIMEOUT"
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         print(f"   ⚠️ JSON error (attempt {attempt}): {str(e)[:80]}")
+        try:
+            print(f"   ↳ Raw response was: {response.text[:500]}")
+        except Exception:
+            pass
         return "JSON_ERROR"
     except requests.exceptions.HTTPError as e:
-        print(f"   ❌ Groq API HTTP error: {str(e)[:150]}")
+        # Body already printed above before raise_for_status(), so just log the short summary here.
+        print(f"   ❌ Groq API HTTPError raised: {str(e)[:150]}")
         return "UNKNOWN_ERROR"
     except Exception as e:
         print(f"   ❌ Error: {str(e)[:100]}")
@@ -306,6 +389,9 @@ def main():
     if not os.path.exists(INPUT_FILE):
         print(f"❌ '{INPUT_FILE}' nahi mila!")
         sys.exit(1)
+
+    # ⬇️ NAYA: run se pehle hi Groq key + model + endpoint sab check ho jayega
+    run_preflight_check()
 
     all_leads = []
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
