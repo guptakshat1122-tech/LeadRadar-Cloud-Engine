@@ -1,568 +1,2638 @@
+```python
 import csv
-import os
 import json
-import time
-import sys
-import requests
+import os
 import re
+import sys
+import time
+import random
+import shutil
+import requests
 
-# ==========================================
-# ⚙️ CONFIGURATION — ab Groq cloud API use karta hai (koi local Ollama nahi chahiye)
-# ==========================================
-INPUT_FILE   = 'Ultimate_God_Leads.csv'
-OUTPUT_FILE  = 'Bawa_Categorized_Leads.csv'
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL_NAME   = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
-BATCH_SIZE   = 5          # Groq cloud fast hai, Ollama jaisa 2 rakhne ki zaroorat nahi
-MAX_RETRIES  = 3          # sirf REAL errors ke liye (rate-limit alag se handle hota hai)
-MAX_RATE_LIMIT_RETRIES = 8  # rate-limit koi "failure" nahi hai, isliye zyada patience
 
-# Adaptive spacing — agar rate-limit baar baar lage to batches ke beech gap khud badhega
+# ============================================================
+# BAWA AI LEAD CATEGORIZER v3.0 FINAL
+# ------------------------------------------------------------
+# INPUT:
+#   Ultimate_God_Leads.csv
+#
+# FINAL OUTPUT:
+#   Bawa_Categorized_Leads.csv
+#
+# PARTIAL OUTPUT:
+#   Bawa_Categorized_Leads.partial.csv
+#
+# PURPOSE:
+#   Website X-Ray data ko AI se classify karke final lead
+#   categories generate karna.
+#
+# MAJOR IMPROVEMENTS:
+#   ✅ Strict JSON Schema
+#   ✅ GPT-OSS 20B structured output
+#   ✅ Partial-output resume
+#   ✅ Atomic finalization
+#   ✅ Failed AI leads remain pending
+#   ✅ No fake "Review Manually" completion
+#   ✅ Batch + single-lead fallback
+#   ✅ Rate-limit aware retry
+#   ✅ Adaptive batch delay
+#   ✅ Model preflight validation
+#   ✅ Input/output schema validation
+#   ✅ Canonical pitch generation
+#   ✅ Duplicate-domain protection
+#   ✅ AI response validation
+#   ✅ Safer JSON parsing
+#   ✅ Existing pipeline-compatible columns
+# ============================================================
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+INPUT_FILE = "Ultimate_God_Leads.csv"
+
+OUTPUT_FILE = "Bawa_Categorized_Leads.csv"
+
+PARTIAL_OUTPUT_FILE = (
+    "Bawa_Categorized_Leads.partial.csv"
+)
+
+GROQ_API_URL = (
+    "https://api.groq.com/openai/v1/chat/completions"
+)
+
+GROQ_MODELS_URL = (
+    "https://api.groq.com/openai/v1/models"
+)
+
+GROQ_API_KEY = os.environ.get(
+    "GROQ_API_KEY",
+    ""
+)
+
+MODEL_NAME = os.environ.get(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b"
+)
+
+
+# ------------------------------------------------------------
+# Batch settings
+# ------------------------------------------------------------
+
+BATCH_SIZE = int(
+    os.environ.get(
+        "GROQ_BATCH_SIZE",
+        "5"
+    )
+)
+
+MAX_RETRIES = 3
+
+MAX_RATE_LIMIT_RETRIES = 8
+
+SINGLE_LEAD_FALLBACK = True
+
+
+# ------------------------------------------------------------
+# Timing
+# ------------------------------------------------------------
+
 BASE_BATCH_SLEEP = 0.5
-MAX_BATCH_SLEEP  = 12.0
-current_batch_sleep = BASE_BATCH_SLEEP
+
+MAX_BATCH_SLEEP = 12.0
+
+current_batch_sleep = (
+    BASE_BATCH_SLEEP
+)
+
 consecutive_rate_limits = 0
 
-stats = {"processed": 0, "auto_done": 0, "ai_skipped": 0, "retries": 0, "rate_limit_hits": 0, "json_fallback_saved": 0}
 
-NAV_WORDS = {
-    "home", "about", "contact", "menu", "toggle", "navigation", "nav",
-    "skip", "close", "open", "search", "cart", "login", "register",
-    "signup", "next", "previous", "back", "read", "more", "click",
-    "here", "cookie", "privacy", "policy", "terms", "copyright",
-    "all", "rights", "reserved", "powered", "inc", "llc", "ltd",
-    "password", "enter", "sign", "get", "started", "learn"
+# ------------------------------------------------------------
+# Request timeout
+# ------------------------------------------------------------
+
+API_TIMEOUT = 120
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+stats = {
+    "processed": 0,
+    "auto_done": 0,
+    "ai_done": 0,
+    "pending": 0,
+    "retries": 0,
+    "rate_limit_hits": 0,
+    "single_fallback_attempts": 0,
+    "single_fallback_saved": 0,
+    "validation_failures": 0,
 }
 
-def extract_content(text, domain=""):
-    """Meaningful words only — nav garbage hatao."""
-    if not text or text.strip().lower() in ("none", ""):
+
+# ============================================================
+# OUTPUT COLUMNS
+# ------------------------------------------------------------
+# Existing downstream contract preserved.
+# ============================================================
+
+OUTPUT_COLUMNS = [
+    "Pitch_Category",
+    "Business_Type",
+    "Product_Category",
+]
+
+
+# ============================================================
+# NAVIGATION / BOILERPLATE WORDS
+# ============================================================
+
+NAV_WORDS = {
+    "home",
+    "about",
+    "contact",
+    "menu",
+    "toggle",
+    "navigation",
+    "nav",
+    "skip",
+    "close",
+    "open",
+    "search",
+    "cart",
+    "login",
+    "register",
+    "signup",
+    "sign",
+    "next",
+    "previous",
+    "back",
+    "read",
+    "more",
+    "click",
+    "here",
+    "cookie",
+    "privacy",
+    "policy",
+    "terms",
+    "copyright",
+    "all",
+    "rights",
+    "reserved",
+    "powered",
+    "inc",
+    "llc",
+    "ltd",
+    "password",
+    "enter",
+    "get",
+    "started",
+    "learn",
+}
+
+
+# ============================================================
+# CATEGORY DEFINITIONS
+# ============================================================
+
+PITCH_CATEGORIES = {
+    1: "🔥 1. Pre-Launch",
+    2: "🤖 2. SaaS/Tech",
+    3: "💰 3. D2C Ad Spenders",
+    4: "🎬 4. Video-First Brands",
+    5: "🛠️ 5. Service Agencies",
+    6: "🟢 6. General Contacts",
+}
+
+
+# ============================================================
+# BASIC TEXT CLEANING
+# ============================================================
+
+def clean_field(
+    text,
+    max_len=300,
+):
+    if not text:
         return ""
-    text = text.encode("utf-8", errors="ignore").decode("utf-8")
-    text = "".join(c for c in text if c.isprintable() and ord(c) < 65536)
-    domain_root = re.sub(r'[^a-z0-9]', '', domain.split(".")[0].lower()) if domain else ""
-    words = re.findall(r'[a-zA-Z]{3,}', text)
+
+    text = str(text)
+
+    if text.strip().lower() in {
+        "none",
+        "null",
+        "nan",
+    }:
+        return ""
+
+    text = (
+        text
+        .encode(
+            "utf-8",
+            errors="ignore",
+        )
+        .decode(
+            "utf-8",
+            errors="ignore",
+        )
+    )
+
+    text = "".join(
+        char
+        for char in text
+        if char.isprintable()
+        or char in "\n\t"
+    )
+
+    text = (
+        text
+        .replace("\\", " ")
+        .replace('"', "'")
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()[:max_len]
+
+
+def normalize_domain(
+    domain,
+):
+    if not domain:
+        return ""
+
+    domain = (
+        str(domain)
+        .strip()
+        .lower()
+    )
+
+    domain = re.sub(
+        r"^[a-z][a-z0-9+.-]*://",
+        "",
+        domain,
+        flags=re.I,
+    )
+
+    domain = re.sub(
+        r"^www\.",
+        "",
+        domain,
+        flags=re.I,
+    )
+
+    domain = re.split(
+        r"[/?#]",
+        domain,
+        maxsplit=1,
+    )[0]
+
+    return domain.rstrip(".")
+
+
+# ============================================================
+# AI CONTENT EXTRACTION
+# ============================================================
+
+def extract_content(
+    text,
+    domain="",
+    max_words=90,
+):
+    """
+    Remove obvious navigation garbage and duplicate words.
+
+    Keeps enough semantic content for AI classification without
+    unnecessarily increasing token usage.
+    """
+
+    if not text:
+        return ""
+
+    text = clean_field(
+        text,
+        1200,
+    )
+
+    if not text:
+        return ""
+
+    domain_root = re.sub(
+        r"[^a-z0-9]",
+        "",
+        normalize_domain(
+            domain
+        ).split(".")[0],
+    )
+
+    words = re.findall(
+        r"[A-Za-z]{3,}",
+        text,
+    )
+
     seen = {}
+
     clean = []
-    for w in words:
-        wl = w.lower()
-        if wl in NAV_WORDS or wl == domain_root:
+
+    for word in words:
+
+        word_lower = word.lower()
+
+        if word_lower in NAV_WORDS:
             continue
-        seen[wl] = seen.get(wl, 0) + 1
-        if seen[wl] <= 2:
-            clean.append(w)
-        if len(clean) >= 80:
-            break
-    return " ".join(clean)
 
-def clean_field(text, max_len=250):
-    if not text or text.strip().lower() in ("none", ""):
-        return ""
-    text = text.encode("utf-8", errors="ignore").decode("utf-8")
-    text = "".join(c for c in text if c.isprintable() and ord(c) < 65536)
-    return text.replace("\\", " ").replace('"', "'").strip()[:max_len]
+        if (
+            domain_root
+            and word_lower == domain_root
+        ):
+            continue
 
-# ==========================================
-# ⚡ INSTANT RULES
-# ==========================================
-PARKED_SIGNALS    = ["parked domain", "hostinger dns", "domain for sale", "buy this domain",
-                     "hugedomains", "sedoparking", "undeveloped", "welcome to nginx"]
-PRELAUNCH_SIGNALS = ["launching soon", "coming soon", "under construction",
-                     "check back for an update", "being worked on", "we're under construction",
-                     "opening soon", "be the first to know when we launch"]
+        seen[word_lower] = (
+            seen.get(
+                word_lower,
+                0
+            )
+            + 1
+        )
 
-def is_parked(lead):
-    combined = ((lead.get("Title","") or "") + " " + (lead.get("Page_Text","") or "")).lower()
-    return any(s in combined for s in PARKED_SIGNALS)
+        # Avoid repetitive website boilerplate.
+        if seen[word_lower] > 2:
+            continue
 
-def is_prelaunch(lead):
-    stage    = (lead.get("Brand_Stage","") or "").lower()
-    combined = ((lead.get("Title","") or "") + " " + (lead.get("Page_Text","") or "")).lower()
-    return stage == "pre-launch" or any(s in combined for s in PRELAUNCH_SIGNALS)
+        clean.append(
+            word
+        )
 
-def has_no_content(lead):
-    title = clean_field(lead.get("Title",""))
-    meta  = clean_field(lead.get("Meta_Description",""))
-    cont  = extract_content(lead.get("Page_Text",""), lead.get("Domain",""))
-    return len(title + meta + cont) < 10
-
-# ==========================================
-# 🔧 CATEGORY NORMALIZER
-# ==========================================
-def normalize_category(pitch, domain="", biz="", prod=""):
-    """Fix malformed categories — replace (NICHE) with actual industry, fix wrong emojis."""
-    if not pitch:
-        return "🟢 6. General Contacts"
-
-    EMOJI_FIX = {
-        "🍺": "🎬", "📝": "🛠️", "🎥": "🎬", "📱": "🤖",
-        "💻": "🤖", "🏥": "🛠️", "🍔": "🛠️", "🏠": "🛠️",
-        "🌿": "💰", "👗": "💰", "🎓": "🛠️", "⚖️": "🛠️",
-    }
-    for wrong, right in EMOJI_FIX.items():
-        if pitch.startswith(wrong):
-            pitch = right + pitch[len(wrong):]
-
-    pitch_lower = pitch.lower()
-    INVENTED = ["author", "blogger", "writer", "poet"]
-    for inv in INVENTED:
-        if pitch_lower.startswith(inv) or f" {inv}" in pitch_lower[:15]:
-            niche_match = re.search(r"\(.*?\)", pitch)
-            niche = niche_match.group(0) if niche_match else ""
-            pitch = f"🛠️ 5. Service Agencies {niche}".strip()
+        if len(clean) >= max_words:
             break
 
-    if "(NICHE)" in pitch or "(niche)" in pitch.lower():
-        hint = (biz + " " + prod).lower()
-        if any(x in hint for x in ["health", "medical", "clinic", "doctor", "pharma", "dental"]):
-            niche = "Healthcare"
-        elif any(x in hint for x in ["fitness", "gym", "sport", "athlet", "workout"]):
-            niche = "Fitness"
-        elif any(x in hint for x in ["fashion", "cloth", "wear", "apparel", "textile"]):
-            niche = "Fashion"
-        elif any(x in hint for x in ["food", "restaurant", "cafe", "dining", "kitchen", "catering"]):
-            niche = "Food & Beverage"
-        elif any(x in hint for x in ["tech", "software", "saas", "ai", "digital", "cloud"]):
-            niche = "Tech"
-        elif any(x in hint for x in ["real estate", "property", "realty", "housing"]):
-            niche = "Real Estate"
-        elif any(x in hint for x in ["market", "agency", "seo", "ads", "creative"]):
-            niche = "Marketing"
-        elif any(x in hint for x in ["educat", "school", "learn", "tutor", "academy"]):
-            niche = "Education"
-        elif any(x in hint for x in ["beauty", "skin", "cosmetic", "salon", "hair"]):
-            niche = "Beauty"
-        elif any(x in hint for x in ["legal", "law", "lawyer", "attorney"]):
-            niche = "Legal"
-        elif any(x in hint for x in ["finance", "invest", "wealth", "banking", "insurance"]):
-            niche = "Finance"
-        else:
-            niche = domain.split(".")[0].title() if domain else "General"
-        pitch = re.sub(r'\(NICHE\)', f"({niche})", pitch, flags=re.IGNORECASE)
-
-    return pitch
-
-# ==========================================
-# 🩺 STARTUP SANITY CHECK — pehle hi pata chal jaye galti kahan hai
-# ==========================================
-def run_preflight_check():
-    print("🩺 Preflight check chal raha hai...")
-
-    # 1) Key loaded hai ya nahi
-    if not GROQ_API_KEY:
-        print("❌ GROQ_API_KEY khaali hai! Env var / GitHub secret set nahi hua.")
-        sys.exit(1)
-    else:
-        masked = GROQ_API_KEY[:4] + "..." + GROQ_API_KEY[-4:] if len(GROQ_API_KEY) > 8 else "***"
-        print(f"   ✅ GROQ_API_KEY mil gayi (length={len(GROQ_API_KEY)}, {masked})")
-
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-
-    # 2) Key valid hai + model list fetch karke dekho MODEL_NAME available hai ya nahi
-    try:
-        resp = requests.get(GROQ_MODELS_URL, headers=headers, timeout=30)
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Groq se connect hi nahi ho paaya: {e}")
-        sys.exit(1)
-
-    if resp.status_code == 401:
-        print("❌ GROQ_API_KEY invalid/expired hai (401 Unauthorized).")
-        print(f"   ↳ Response: {resp.text[:300]}")
-        sys.exit(1)
-
-    if resp.status_code != 200:
-        print(f"❌ Model list fetch nahi ho payi — status {resp.status_code}")
-        print(f"   ↳ Response: {resp.text[:300]}")
-        sys.exit(1)
-
-    try:
-        available_models = [m["id"] for m in resp.json().get("data", [])]
-    except Exception as e:
-        print(f"⚠️  Model list parse nahi ho payi: {e}")
-        available_models = []
-
-    print(f"   ✅ API key valid hai. {len(available_models)} models available hain.")
-
-    if available_models and MODEL_NAME not in available_models:
-        print(f"❌ MODEL_NAME '{MODEL_NAME}' Groq ke available models me nahi hai!")
-        print(f"   ↳ Available models: {available_models}")
-        print("   👉 GROQ_MODEL env var ko available list me se koi valid model id set karo.")
-        sys.exit(1)
-    else:
-        print(f"   ✅ Model '{MODEL_NAME}' available hai.")
-
-    # 3) Ek dummy real request bhi maar ke dekho — end-to-end confirm
-    test_payload = {
-        "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": "Reply with just the word OK."}],
-        "max_tokens": 5
-    }
-    try:
-        test_resp = requests.post(GROQ_API_URL, json=test_payload,
-                                   headers={**headers, "Content-Type": "application/json"},
-                                   timeout=30)
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Test chat completion request fail ho gayi: {e}")
-        sys.exit(1)
-
-    if test_resp.status_code != 200:
-        print(f"❌ Test chat completion fail — status {test_resp.status_code}")
-        print(f"   ↳ Response: {test_resp.text[:500]}")
-        sys.exit(1)
-
-    print("   ✅ Test chat completion successful. Sab thik hai, aage badhte hain.\n")
+    return " ".join(
+        clean
+    )
 
 
-# ==========================================
-# 🧠 AI CATEGORIZER — Groq cloud (OpenAI-compatible) API
-# ==========================================
-SYSTEM_PROMPT = """You are a business analyst. Read each website's text and categorize it.
+# ============================================================
+# INSTANT SIGNALS
+# ============================================================
 
-Use ALL text signals: title, meta description, and content keywords.
-Even if content is short, make your best guess from domain name + title + meta.
+PARKED_SIGNALS = [
+    "parked domain",
+    "hostinger dns",
+    "domain for sale",
+    "this domain is for sale",
+    "buy this domain",
+    "hugedomains",
+    "sedoparking",
+    "undeveloped",
+    "domain parking",
+    "welcome to nginx",
+]
 
-OUTPUT — use EXACTLY these formats:
-- "🔥 1. Pre-Launch" — coming soon, not launched
-- "🤖 2. SaaS/Tech (NICHE)" — software, app, platform, tool, AI product
-- "💰 3. D2C Ad Spenders (NICHE)" — physical product brand selling online
-- "🎬 4. Video-First Brands (NICHE)" — video company, media studio, YouTube channel
-- "🛠️ 5. Service Agencies (NICHE)" — agency, consultant, doctor, restaurant, school, local service
-- "🟢 6. General Contacts" — ONLY if truly zero signals, absolute last resort
 
-Replace NICHE with real industry. Examples:
-"🤖 2. SaaS/Tech (Personality Analytics)"
-"🛠️ 5. Service Agencies (Influencer Marketing)"
-"💰 3. D2C Ad Spenders (Organic Fashion)"
-"🤖 2. SaaS/Tech (AI Robotics)"
+PRELAUNCH_SIGNALS = [
+    "launching soon",
+    "coming soon",
+    "under construction",
+    "check back for an update",
+    "check back soon",
+    "being worked on",
+    "we're under construction",
+    "opening soon",
+    "be the first to know when we launch",
+    "join the waitlist",
+    "early access",
+]
 
-RULES:
-- NEVER return "(NICHE)" literally — always replace with actual industry
-- NEVER return Unknown for business_type if you have any signals
-- If content is foreign language, use domain+title to guess
-- Return items in SAME ORDER as input using "index"
 
-Return ONLY a raw JSON object with this exact shape (no markdown fences, no extra text):
-{"items": [{"index":0,"domain":"x.com","pitch_category":"🛠️ 5. Service Agencies (Healthcare)","true_business_type":"Orthopaedic Clinic","true_product_category":"Joint Replacement Surgery"}]}
-"""
+def lead_text(
+    lead,
+):
+    return (
+        clean_field(
+            lead.get(
+                "Title",
+                ""
+            ),
+            200,
+        )
+        + " "
+        + clean_field(
+            lead.get(
+                "Meta_Description",
+                ""
+            ),
+            400,
+        )
+        + " "
+        + clean_field(
+            lead.get(
+                "Page_Text",
+                ""
+            ),
+            800,
+        )
+    ).lower()
 
-def categorize_batch_with_ai(batch_leads, attempt=1):
-    batch_data = [
-        {
-            "index":   i,
-            "domain":  l.get("Domain", ""),
-            "title":   clean_field(l.get("Title",""), 150),
-            "meta":    clean_field(l.get("Meta_Description",""), 300),
-            "content": extract_content(l.get("Page_Text",""), l.get("Domain",""))
-        }
-        for i, l in enumerate(batch_leads)
+
+def is_parked(
+    lead,
+):
+    text = lead_text(
+        lead
+    )
+
+    return any(
+        signal in text
+        for signal in PARKED_SIGNALS
+    )
+
+
+def is_prelaunch(
+    lead,
+):
+    stage = (
+        clean_field(
+            lead.get(
+                "Brand_Stage",
+                ""
+            ),
+            200,
+        )
+        .lower()
+    )
+
+    text = lead_text(
+        lead
+    )
+
+    if "pre-launch" in stage:
+        return True
+
+    return any(
+        signal in text
+        for signal in PRELAUNCH_SIGNALS
+    )
+
+
+def has_no_content(
+    lead,
+):
+    title = clean_field(
+        lead.get(
+            "Title",
+            ""
+        ),
+        200,
+    )
+
+    meta = clean_field(
+        lead.get(
+            "Meta_Description",
+            ""
+        ),
+        300,
+    )
+
+    content = extract_content(
+        lead.get(
+            "Page_Text",
+            ""
+        ),
+        lead.get(
+            "Domain",
+            ""
+        ),
+    )
+
+    combined = (
+        title
+        + meta
+        + content
+    )
+
+    return len(
+        combined.strip()
+    ) < 10
+
+
+# ============================================================
+# NICHE RESOLUTION
+# ============================================================
+
+def infer_niche_from_text(
+    text,
+):
+    """
+    Local deterministic fallback for cases where AI gives
+    no useful niche.
+    """
+
+    text = (
+        text or ""
+    ).lower()
+
+    niche_rules = [
+        (
+            "Healthcare",
+            [
+                "health",
+                "medical",
+                "clinic",
+                "doctor",
+                "pharma",
+                "dental",
+                "hospital",
+                "therapy",
+            ],
+        ),
+        (
+            "Fitness",
+            [
+                "fitness",
+                "gym",
+                "sport",
+                "athlet",
+                "workout",
+                "wellness",
+            ],
+        ),
+        (
+            "Fashion",
+            [
+                "fashion",
+                "cloth",
+                "wear",
+                "apparel",
+                "textile",
+                "outfit",
+            ],
+        ),
+        (
+            "Food & Beverage",
+            [
+                "food",
+                "restaurant",
+                "cafe",
+                "dining",
+                "kitchen",
+                "catering",
+                "coffee",
+                "bakery",
+            ],
+        ),
+        (
+            "Tech",
+            [
+                "tech",
+                "software",
+                "saas",
+                "ai",
+                "digital",
+                "cloud",
+                "platform",
+            ],
+        ),
+        (
+            "Real Estate",
+            [
+                "real estate",
+                "property",
+                "realty",
+                "housing",
+                "apartment",
+                "villa",
+            ],
+        ),
+        (
+            "Marketing",
+            [
+                "marketing",
+                "agency",
+                "seo",
+                "ads",
+                "creative",
+                "social media",
+            ],
+        ),
+        (
+            "Education",
+            [
+                "education",
+                "school",
+                "learn",
+                "tutor",
+                "academy",
+                "course",
+                "training",
+            ],
+        ),
+        (
+            "Beauty",
+            [
+                "beauty",
+                "skin",
+                "cosmetic",
+                "salon",
+                "hair",
+                "makeup",
+            ],
+        ),
+        (
+            "Finance",
+            [
+                "finance",
+                "invest",
+                "wealth",
+                "banking",
+                "insurance",
+                "fintech",
+                "crypto",
+            ],
+        ),
+        (
+            "Travel",
+            [
+                "travel",
+                "hotel",
+                "resort",
+                "holiday",
+                "tour",
+                "hospitality",
+            ],
+        ),
     ]
 
-    user_prompt = f"Websites:\n{json.dumps(batch_data, indent=2)}"
+    for niche, signals in niche_rules:
+
+        if any(
+            signal in text
+            for signal in signals
+        ):
+            return niche
+
+    return "General"
+
+
+# ============================================================
+# PITCH NORMALIZATION
+# ============================================================
+
+def build_pitch_category(
+    pitch_id,
+    niche,
+    lead_text_value="",
+):
+    """
+    AI returns a numeric pitch_id.
+    We construct the final canonical string ourselves.
+    """
+
+    try:
+        pitch_id = int(
+            pitch_id
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        pitch_id = 6
+
+    if pitch_id not in PITCH_CATEGORIES:
+        pitch_id = 6
+
+    if pitch_id == 1:
+        return PITCH_CATEGORIES[1]
+
+    niche = clean_field(
+        niche,
+        80,
+    )
+
+    if not niche:
+        niche = infer_niche_from_text(
+            lead_text_value
+        )
+
+    # Remove placeholder AI outputs.
+    if niche.lower() in {
+        "niche",
+        "unknown",
+        "general",
+        "general / other",
+        "n/a",
+    }:
+
+        niche = infer_niche_from_text(
+            lead_text_value
+        )
+
+    return (
+        f"{PITCH_CATEGORIES[pitch_id]} "
+        f"({niche})"
+    )
+
+
+# ============================================================
+# AI JSON SCHEMA
+# ============================================================
+
+AI_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "minimum": 0,
+                    },
+                    "domain": {
+                        "type": "string",
+                    },
+                    "pitch_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 6,
+                    },
+                    "niche": {
+                        "type": "string",
+                    },
+                    "true_business_type": {
+                        "type": "string",
+                    },
+                    "true_product_category": {
+                        "type": "string",
+                    },
+                },
+                "required": [
+                    "index",
+                    "domain",
+                    "pitch_id",
+                    "niche",
+                    "true_business_type",
+                    "true_product_category",
+                ],
+            },
+        },
+    },
+    "required": [
+        "items",
+    ],
+}
+
+
+# ============================================================
+# AI SYSTEM PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are an expert business intelligence classifier.
+
+Your job is to classify websites into one of six business
+outreach categories.
+
+USE ALL AVAILABLE SIGNALS:
+- domain
+- title
+- meta description
+- page content
+- website intent clues
+
+IMPORTANT:
+Do NOT invent a business based only on a generic domain unless
+there are no other signals.
+
+PITCH CATEGORIES:
+
+1 = Pre-Launch
+Use when the company/site is clearly coming soon,
+launching soon, waitlist, early access, beta launch, etc.
+
+2 = SaaS/Tech
+Use for:
+software
+SaaS
+AI products
+APIs
+platforms
+developer tools
+automation
+cloud products
+technical products
+
+3 = D2C Ad Spenders
+Use for physical-product brands that sell products online.
+Signals include:
+add to cart
+shop
+checkout
+free shipping
+product collection
+buy now
+new arrivals
+etc.
+
+4 = Video-First Brands
+Use for:
+media companies
+production studios
+YouTube-first businesses
+video creators
+content studios
+podcasts
+film/video companies
+
+5 = Service Agencies
+Use for:
+agencies
+consultants
+clinics/doctors
+restaurants
+schools
+law firms
+local businesses
+marketing services
+professional services
+
+6 = General Contacts
+Use ONLY when strong business signals are absent.
+
+NICHE:
+Return a concise real industry/niche.
+
+Examples:
+Beauty
+Organic Fashion
+AI Robotics
+Personality Analytics
+Healthcare
+Influencer Marketing
+Real Estate
+SaaS
+Travel
+Education
+
+TRUE BUSINESS TYPE:
+Return a specific business type where evidence exists.
+
+Examples:
+Orthopaedic Clinic
+D2C Skincare Brand
+AI Workflow SaaS
+Digital Marketing Agency
+Luxury Travel Company
+
+TRUE PRODUCT CATEGORY:
+Return the actual product/service category.
+
+Examples:
+Joint Replacement Surgery
+Skincare Products
+CRM Automation Software
+Influencer Marketing
+Luxury Holiday Packages
+
+DO NOT output:
+Unknown
+N/A
+NICHE
+Generic filler unless the evidence is genuinely absent.
+
+Return one result for EVERY input item.
+Keep the same index as the input.
+"""
+
+
+# ============================================================
+# API HEADERS
+# ============================================================
+
+def api_headers():
+    return {
+        "Authorization": (
+            f"Bearer {GROQ_API_KEY}"
+        ),
+        "Content-Type": (
+            "application/json"
+        ),
+    }
+
+
+# ============================================================
+# SAFE RETRY-AFTER PARSER
+# ============================================================
+
+def get_retry_after(
+    response,
+):
+    value = response.headers.get(
+        "Retry-After"
+    )
+
+    if value is None:
+        return 15
+
+    try:
+        return max(
+            1,
+            min(
+                int(float(value)),
+                120,
+            )
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return 15
+
+
+# ============================================================
+# PRE-FLIGHT
+# ============================================================
+
+def run_preflight_check():
+
+    print(
+        "🩺 Groq preflight check..."
+    )
+
+    if not GROQ_API_KEY:
+
+        print(
+            "❌ GROQ_API_KEY set nahi hai."
+        )
+
+        return False
+
+    headers = api_headers()
+
+    # --------------------------------------------------------
+    # Model list
+    # --------------------------------------------------------
+
+    try:
+
+        response = requests.get(
+            GROQ_MODELS_URL,
+            headers=headers,
+            timeout=30,
+        )
+
+    except requests.exceptions.RequestException as exc:
+
+        print(
+            f"❌ Groq models endpoint failed: "
+            f"{exc}"
+        )
+
+        return False
+
+    if response.status_code == 401:
+
+        print(
+            "❌ GROQ_API_KEY invalid/expired."
+        )
+
+        return False
+
+    if response.status_code != 200:
+
+        print(
+            f"❌ Models endpoint HTTP "
+            f"{response.status_code}"
+        )
+
+        print(
+            response.text[:500]
+        )
+
+        return False
+
+    try:
+
+        data = response.json()
+
+        available_models = {
+            item.get("id")
+            for item in data.get(
+                "data",
+                []
+            )
+            if item.get("id")
+        }
+
+    except Exception as exc:
+
+        print(
+            f"❌ Model response parse failed: "
+            f"{exc}"
+        )
+
+        return False
+
+    print(
+        f"   ✅ API authenticated. "
+        f"{len(available_models)} models visible."
+    )
+
+    if (
+        available_models
+        and MODEL_NAME
+        not in available_models
+    ):
+
+        print(
+            f"❌ Model '{MODEL_NAME}' "
+            f"available nahi hai."
+        )
+
+        print(
+            "   Set GROQ_MODEL to a valid active model."
+        )
+
+        return False
+
+    print(
+        f"   ✅ Model: {MODEL_NAME}"
+    )
+
+    return True
+
+
+# ============================================================
+# BUILD AI INPUT
+# ============================================================
+
+def build_batch_payload(
+    batch,
+):
+
+    payload = []
+
+    for index, lead in enumerate(
+        batch
+    ):
+
+        domain = normalize_domain(
+            lead.get(
+                "Domain",
+                ""
+            )
+        )
+
+        title = clean_field(
+            lead.get(
+                "Title",
+                ""
+            ),
+            150,
+        )
+
+        meta = clean_field(
+            lead.get(
+                "Meta_Description",
+                ""
+            ),
+            300,
+        )
+
+        content = extract_content(
+            lead.get(
+                "Page_Text",
+                ""
+            ),
+            domain,
+            max_words=90,
+        )
+
+        payload.append(
+            {
+                "index": index,
+                "domain": domain,
+                "title": title,
+                "meta": meta,
+                "content": content,
+            }
+        )
+
+    return payload
+
+
+# ============================================================
+# AI RESPONSE VALIDATION
+# ============================================================
+
+def validate_ai_items(
+    parsed,
+    batch,
+):
+    """
+    Only accept AI results that can be reliably mapped to the
+    original batch.
+
+    Missing items are NOT replaced with fake defaults.
+    """
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+        return None
+
+    items = parsed.get(
+        "items"
+    )
+
+    if not isinstance(
+        items,
+        list
+    ):
+        return None
+
+    expected_indices = set(
+        range(
+            len(batch)
+        )
+    )
+
+    valid = {}
+
+    for item in items:
+
+        if not isinstance(
+            item,
+            dict
+        ):
+            continue
+
+        try:
+            index = int(
+                item.get(
+                    "index"
+                )
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+        if index not in expected_indices:
+            continue
+
+        domain = normalize_domain(
+            item.get(
+                "domain",
+                ""
+            )
+        )
+
+        expected_domain = normalize_domain(
+            batch[index].get(
+                "Domain",
+                ""
+            )
+        )
+
+        # Domain must match if returned.
+        if domain and domain != expected_domain:
+            continue
+
+        try:
+
+            pitch_id = int(
+                item.get(
+                    "pitch_id"
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            continue
+
+        if not (
+            1
+            <= pitch_id
+            <= 6
+        ):
+            continue
+
+        niche = clean_field(
+            item.get(
+                "niche",
+                ""
+            ),
+            100,
+        )
+
+        biz = clean_field(
+            item.get(
+                "true_business_type",
+                ""
+            ),
+            150,
+        )
+
+        prod = clean_field(
+            item.get(
+                "true_product_category",
+                ""
+            ),
+            200,
+        )
+
+        lead_signal_text = lead_text(
+            batch[index]
+        )
+
+        if not biz:
+            biz = "Review Manually"
+
+        if not prod:
+            prod = "Review Manually"
+
+        pitch = build_pitch_category(
+            pitch_id,
+            niche,
+            lead_signal_text,
+        )
+
+        valid[index] = {
+            "pitch": pitch,
+            "biz": biz,
+            "prod": prod,
+        }
+
+    # --------------------------------------------------------
+    # We need at least one valid result.
+    # --------------------------------------------------------
+
+    if not valid:
+        return None
+
+    return valid
+
+
+# ============================================================
+# GROQ REQUEST
+# ============================================================
+
+def categorize_batch_with_ai(
+    batch,
+):
+    payload_data = build_batch_payload(
+        batch
+    )
+
+    user_prompt = (
+        "Classify the following websites.\n\n"
+        + json.dumps(
+            payload_data,
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
     payload = {
         "model": MODEL_NAME,
+
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
         ],
-        "temperature": 0.05,
-        "max_tokens": 3500,
-        "response_format": {"type": "json_object"}
-    }
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
+
+        "temperature": 0.0,
+
+        # GPT-OSS supports reasoning_effort.
+        # Low is enough for deterministic classification.
+        "reasoning_effort": "low",
+
+        "max_tokens": 2000,
+
+        # Strict schema is preferred over old JSON mode.
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "lead_classification",
+                "strict": True,
+                "schema": AI_JSON_SCHEMA,
+            },
+        },
     }
 
     try:
-        response = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=90)
 
-        if response.status_code == 429:
-            global consecutive_rate_limits
-            consecutive_rate_limits += 1
-            stats["rate_limit_hits"] += 1
-            retry_after = int(response.headers.get("Retry-After", 15))
-            print(f"   ⏳ Rate limited by Groq — waiting {retry_after}s... (consecutive: {consecutive_rate_limits})")
-            time.sleep(retry_after)
-            return "RATE_LIMITED"
+        response = requests.post(
+            GROQ_API_URL,
+            json=payload,
+            headers=api_headers(),
+            timeout=API_TIMEOUT,
+        )
 
-        # ⬇️ NAYA: status non-200 hote hi pehle poora error body dikhao, phir raise karo
-        if response.status_code != 200:
-            print(f"   ❌ Groq API HTTP error: status={response.status_code}")
-            print(f"   ↳ URL: {response.url}")
-            print(f"   ↳ Body: {response.text[:500]}")
-            response.raise_for_status()
-
-        raw = response.json()["choices"][0]["message"]["content"].strip()
-
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:-1])
-            if raw.startswith("json"):
-                raw = raw[4:].strip()
-
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            parsed = parsed.get("items") or next((v for v in parsed.values() if isinstance(v, list)), [parsed])
-        if not isinstance(parsed, list):
-            return "JSON_ERROR"
-
-        domain_map = {}
-        index_map  = {}
-        for item in parsed:
-            if not isinstance(item, dict):
-                continue
-            biz  = item.get("true_business_type", "")
-            prod = item.get("true_product_category", "")
-            dom  = item.get("domain", "")
-            result = {
-                "pitch": normalize_category(item.get("pitch_category",""), dom, biz, prod),
-                "biz":   biz if biz and biz != "Unknown" else "",
-                "prod":  prod if prod and prod != "Unknown" else ""
-            }
-            if dom:
-                domain_map[dom] = result
-            if item.get("index") is not None:
-                index_map[int(item["index"])] = result
-
-        return {"domain_map": domain_map, "index_map": index_map}
+    except requests.exceptions.Timeout:
+        return {
+            "status": "TIMEOUT",
+        }
 
     except requests.exceptions.ConnectionError:
-        return "CONNECTION_ERROR"
-    except requests.exceptions.Timeout:
-        print(f"   ⏱️ Timeout (attempt {attempt})")
-        return "TIMEOUT"
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        print(f"   ⚠️ JSON error (attempt {attempt}): {str(e)[:80]}")
-        try:
-            print(f"   ↳ Raw response was: {response.text[:500]}")
-        except Exception:
-            pass
-        return "JSON_ERROR"
-    except requests.exceptions.HTTPError as e:
-        # Body already printed above before raise_for_status(), so just log the short summary here.
-        print(f"   ❌ Groq API HTTPError raised: {str(e)[:150]}")
-        return "UNKNOWN_ERROR"
-    except Exception as e:
-        print(f"   ❌ Error: {str(e)[:100]}")
-        return "UNKNOWN_ERROR"
+        return {
+            "status": "CONNECTION_ERROR",
+        }
 
-def categorize_single_lead_fallback(lead):
-    """Jab poora batch ka JSON invalid ho jaaye, ek lead ko akela bhejo —
-    chhota prompt = kam chance of malformed JSON. Sirf ek attempt, koi loop nahi."""
-    result = categorize_batch_with_ai([lead], attempt=1)
-    if isinstance(result, dict) and "domain_map" in result:
-        return get_ai_result(result, lead.get("Domain", ""), 0)
-    return None
+    except requests.exceptions.RequestException as exc:
+        return {
+            "status": "REQUEST_ERROR",
+            "error": str(exc),
+        }
 
-# ==========================================
-# 🔁 RETRY WRAPPER
-# ==========================================
-DEFAULT = {"pitch": "🟢 6. General Contacts", "biz": "Review Manually", "prod": "Review Manually"}
+    # ========================================================
+    # RATE LIMIT
+    # ========================================================
 
-def get_ai_result(mapping, domain, index):
-    if mapping is None:
-        return DEFAULT
-    if domain in mapping["domain_map"]:
-        return mapping["domain_map"][domain]
-    if index in mapping["index_map"]:
-        return mapping["index_map"][index]
-    return DEFAULT
+    if response.status_code == 429:
 
-def process_batch_with_retry(batch, batch_num):
-    global consecutive_rate_limits
-    real_attempt = 0
-    rate_limit_attempt = 0
+        global consecutive_rate_limits
 
-    while real_attempt < MAX_RETRIES and rate_limit_attempt < MAX_RATE_LIMIT_RETRIES:
-        result = categorize_batch_with_ai(batch, real_attempt + 1)
+        consecutive_rate_limits += 1
 
-        if isinstance(result, dict) and "domain_map" in result:
-            consecutive_rate_limits = 0  # success — reset the adaptive backoff
-            return result
+        stats[
+            "rate_limit_hits"
+        ] += 1
 
-        elif result == "RATE_LIMITED":
-            # Rate limit is not a real failure — retry with its own budget,
-            # doesn't eat into MAX_RETRIES meant for genuine errors.
-            rate_limit_attempt += 1
-            stats["retries"] += 1
-            continue
+        retry_after = get_retry_after(
+            response
+        )
 
-        elif result == "CONNECTION_ERROR":
-            real_attempt += 1
-            stats["retries"] += 1
-            print("🛑 Groq se connect nahi ho paaya! 15s wait...")
-            time.sleep(15)
+        return {
+            "status": "RATE_LIMITED",
+            "retry_after": retry_after,
+        }
 
-        else:
-            real_attempt += 1
-            stats["retries"] += 1
-            if real_attempt < MAX_RETRIES:
-                wait = 5 * real_attempt
-                print(f"   🔁 Retry {real_attempt}/{MAX_RETRIES} in {wait}s...")
-                time.sleep(wait)
+    # ========================================================
+    # HTTP ERROR
+    # ========================================================
 
-    # ⬇️ NAYA: poora batch skip karne se pehle, ek-ek lead alag se try karo.
-    # JSON-validate-fail jaisa error aksar batch-size ki wajah se hota hai —
-    # single-lead request me chance kam hota hai.
-    print(f"   🧩 Batch {batch_num} ke leads ko individually try kar rahe hain (last resort)...")
-    domain_map, index_map = {}, {}
-    saved = 0
-    for i, lead in enumerate(batch):
-        single_result = categorize_single_lead_fallback(lead)
-        if single_result:
-            domain_map[lead.get("Domain", "")] = single_result
-            index_map[i] = single_result
-            saved += 1
-        time.sleep(0.3)
+    if response.status_code != 200:
 
-    if saved > 0:
-        stats["json_fallback_saved"] += saved
-        print(f"   ✅ {saved}/{len(batch)} leads fallback se bach gaye.")
+        return {
+            "status": "HTTP_ERROR",
+            "code": response.status_code,
+            "body": response.text[:1000],
+        }
 
-    if saved < len(batch):
-        stats["ai_skipped"] += (len(batch) - saved)
+    # ========================================================
+    # RESPONSE JSON
+    # ========================================================
 
-    if saved == 0:
-        print(f"   🚫 Batch {batch_num} fully skip.")
+    try:
+
+        outer = response.json()
+
+        content = (
+            outer[
+                "choices"
+            ][0][
+                "message"
+            ][
+                "content"
+            ]
+        )
+
+        if not content:
+            return {
+                "status": "EMPTY_RESPONSE",
+            }
+
+        parsed = json.loads(
+            content
+        )
+
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+    ) as exc:
+
+        stats[
+            "validation_failures"
+        ] += 1
+
+        return {
+            "status": "JSON_ERROR",
+            "error": str(exc),
+            "raw": response.text[:1000],
+        }
+
+    # ========================================================
+    # VALIDATE
+    # ========================================================
+
+    validated = validate_ai_items(
+        parsed,
+        batch,
+    )
+
+    if validated is None:
+
+        stats[
+            "validation_failures"
+        ] += 1
+
+        return {
+            "status": "VALIDATION_ERROR",
+            "raw": str(
+                parsed
+            )[:1000],
+        }
+
+    return {
+        "status": "SUCCESS",
+        "items": validated,
+    }
+
+
+# ============================================================
+# SINGLE LEAD FALLBACK
+# ============================================================
+
+def categorize_single_lead(
+    lead,
+):
+    """
+    Retry one problematic lead independently.
+    """
+
+    stats[
+        "single_fallback_attempts"
+    ] += 1
+
+    result = categorize_batch_with_ai(
+        [lead]
+    )
+
+    if result.get(
+        "status"
+    ) != "SUCCESS":
+
         return None
 
-    return {"domain_map": domain_map, "index_map": index_map}
+    items = result.get(
+        "items",
+        {}
+    )
 
-# ==========================================
-# 🚀 MAIN
-# ==========================================
-def main():
-    print("=" * 60)
-    print("☁️  [GROQ CLOUD AI] Smart Categorizer — Bawa God Mode")
-    print("=" * 60)
+    return items.get(
+        0
+    )
 
-    if not GROQ_API_KEY:
-        print("❌ GROQ_API_KEY set nahi hai! GitHub repo secrets me add karo ya env var set karo.")
-        sys.exit(1)
 
-    if not os.path.exists(INPUT_FILE):
-        print(f"❌ '{INPUT_FILE}' nahi mila!")
-        sys.exit(1)
+# ============================================================
+# PROCESS BATCH WITH RETRIES
+# ============================================================
 
-    # ⬇️ NAYA: run se pehle hi Groq key + model + endpoint sab check ho jayega
-    run_preflight_check()
+def process_batch_with_retry(
+    batch,
+    batch_num,
+):
 
-    all_leads = []
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        original_fieldnames = reader.fieldnames or []
-        for row in reader:
-            all_leads.append(row)
+    global current_batch_sleep
+    global consecutive_rate_limits
 
-    extra = ["Pitch_Category", "Business_Type", "Product_Category"]
-    fieldnames = extra + [fn for fn in original_fieldnames if fn not in extra]
+    real_attempts = 0
 
-    processed_domains = set()
-    file_mode = "w"
-    if os.path.exists(OUTPUT_FILE):
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                processed_domains.add(row.get("Domain", ""))
-        file_mode = "a"
-        print(f"⏭️  Resuming — {len(processed_domains)} leads already done.")
+    rate_limit_attempts = 0
 
-    leads_to_process = [l for l in all_leads if l.get("Domain") not in processed_domains]
-    total = len(leads_to_process)
-    if total == 0:
-        print("✅ Saari leads ho chuki hain!")
+    while (
+        real_attempts
+        < MAX_RETRIES
+        and
+        rate_limit_attempts
+        < MAX_RATE_LIMIT_RETRIES
+    ):
+
+        result = (
+            categorize_batch_with_ai(
+                batch
+            )
+        )
+
+        status = result.get(
+            "status"
+        )
+
+        # ----------------------------------------------------
+        # Success
+        # ----------------------------------------------------
+
+        if status == "SUCCESS":
+
+            consecutive_rate_limits = 0
+
+            return result.get(
+                "items",
+                {}
+            )
+
+        # ----------------------------------------------------
+        # Rate limit
+        # ----------------------------------------------------
+
+        if status == "RATE_LIMITED":
+
+            rate_limit_attempts += 1
+
+            stats[
+                "retries"
+            ] += 1
+
+            retry_after = result.get(
+                "retry_after",
+                15,
+            )
+
+            # Small jitter avoids repeatedly hitting the exact
+            # same boundary.
+            jitter = random.uniform(
+                0.2,
+                1.0,
+            )
+
+            wait = (
+                retry_after
+                + jitter
+            )
+
+            print(
+                f"   ⏳ Rate limit "
+                f"{rate_limit_attempts}/"
+                f"{MAX_RATE_LIMIT_RETRIES} "
+                f"— waiting {wait:.1f}s..."
+            )
+
+            time.sleep(
+                wait
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Other failures
+        # ----------------------------------------------------
+
+        real_attempts += 1
+
+        stats[
+            "retries"
+        ] += 1
+
+        if real_attempts < MAX_RETRIES:
+
+            wait = min(
+                5 * real_attempts,
+                20,
+            )
+
+            print(
+                f"   🔁 Batch retry "
+                f"{real_attempts}/"
+                f"{MAX_RETRIES} "
+                f"in {wait}s..."
+            )
+
+            time.sleep(
+                wait
+            )
+
+    # ========================================================
+    # SINGLE-LEAD FALLBACK
+    # ========================================================
+
+    if not SINGLE_LEAD_FALLBACK:
+
+        return {}
+
+    print(
+        f"   🧩 Batch {batch_num}: "
+        f"individual fallback start..."
+    )
+
+    recovered = {}
+
+    for index, lead in enumerate(
+        batch
+    ):
+
+        result = categorize_single_lead(
+            lead
+        )
+
+        if result:
+
+            recovered[
+                index
+            ] = result
+
+            stats[
+                "single_fallback_saved"
+            ] += 1
+
+        # Small spacing between fallback calls.
+        time.sleep(
+            0.35
+        )
+
+    if recovered:
+
+        print(
+            f"   ✅ Individual fallback: "
+            f"{len(recovered)}/{len(batch)} "
+            f"saved."
+        )
+
+    return recovered
+
+
+# ============================================================
+# CSV HELPERS
+# ============================================================
+
+def get_input_fieldnames(
+    leads,
+):
+    if not leads:
+        return []
+
+    return list(
+        leads[0].keys()
+    )
+
+
+def build_output_fieldnames(
+    original_fields,
+):
+    """
+    Put our new classification fields first while preserving
+    all X-Ray fields.
+    """
+
+    return (
+        OUTPUT_COLUMNS
+        + [
+            field
+            for field in original_fields
+            if field not in OUTPUT_COLUMNS
+        ]
+    )
+
+
+def load_csv_rows(
+    filepath,
+):
+    if not os.path.exists(
+        filepath
+    ):
+        return [], []
+
+    with open(
+        filepath,
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as file:
+
+        reader = csv.DictReader(
+            file
+        )
+
+        rows = list(
+            reader
+        )
+
+        fields = (
+            reader.fieldnames
+            or []
+        )
+
+    return rows, fields
+
+
+# ============================================================
+# PARTIAL OUTPUT RESUME
+# ============================================================
+
+def load_processed_domains(
+    filepath,
+):
+    """
+    Read only successfully written rows from partial/final file.
+
+    This makes resume deterministic.
+    """
+
+    processed = set()
+
+    if not os.path.exists(
+        filepath
+    ):
+        return processed
+
+    try:
+
+        with open(
+            filepath,
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as file:
+
+            reader = csv.DictReader(
+                file
+            )
+
+            for row in reader:
+
+                domain = normalize_domain(
+                    row.get(
+                        "Domain",
+                        ""
+                    )
+                )
+
+                if domain:
+                    processed.add(
+                        domain
+                    )
+
+    except Exception as exc:
+
+        print(
+            f"⚠️ Resume file read failed: "
+            f"{exc}"
+        )
+
+    return processed
+
+
+# ============================================================
+# INITIALIZE PARTIAL FILE
+# ============================================================
+
+def ensure_partial_file(
+    fieldnames,
+):
+    """
+    Create partial output with header when needed.
+    """
+
+    if (
+        os.path.exists(
+            PARTIAL_OUTPUT_FILE
+        )
+        and
+        os.path.getsize(
+            PARTIAL_OUTPUT_FILE
+        ) > 0
+    ):
         return
 
-    prelaunch = [l for l in leads_to_process if is_prelaunch(l) and not is_parked(l)]
-    parked    = [l for l in leads_to_process if is_parked(l)]
-    no_data   = [l for l in leads_to_process if not is_prelaunch(l) and not is_parked(l) and has_no_content(l)]
-    ai_leads  = [l for l in leads_to_process if not is_prelaunch(l) and not is_parked(l) and not has_no_content(l)]
-    total_batches = (len(ai_leads) + BATCH_SIZE - 1) // BATCH_SIZE
+    with open(
+        PARTIAL_OUTPUT_FILE,
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as file:
 
-    print(f"📊 Total pending   : {total}")
-    print(f"🔥 Pre-Launch      : {len(prelaunch)}")
-    print(f"🅿️  Parked          : {len(parked)}")
-    print(f"⬛ No content       : {len(no_data)}")
-    print(f"🤖 AI to process   : {len(ai_leads)}  (model: {MODEL_NAME})")
-    print("-" * 60 + "\n")
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
 
-    start_time = time.time()
+        writer.writeheader()
 
-    with open(OUTPUT_FILE, file_mode, newline="", encoding="utf-8") as out_f:
-        writer = csv.DictWriter(out_f, fieldnames=fieldnames, extrasaction="ignore")
-        if file_mode == "w":
-            writer.writeheader()
 
-        for lead in prelaunch:
-            lead["Pitch_Category"]   = "🔥 1. Pre-Launch"
-            lead["Business_Type"]    = "Pre-Launch Brand"
-            lead["Product_Category"] = "Coming Soon"
-            writer.writerow(lead)
-            stats["auto_done"] += 1
+# ============================================================
+# APPEND PARTIAL ROW
+# ============================================================
 
-        for lead in parked:
-            lead["Pitch_Category"]   = "🟢 6. General Contacts"
-            lead["Business_Type"]    = "Parked / No Website"
-            lead["Product_Category"] = "N/A"
-            writer.writerow(lead)
-            stats["auto_done"] += 1
+def append_partial_rows(
+    rows,
+    fieldnames,
+):
+    if not rows:
+        return
 
-        for lead in no_data:
-            lead["Pitch_Category"]   = "🟢 6. General Contacts"
-            lead["Business_Type"]    = "No Content Found"
-            lead["Product_Category"] = "N/A"
-            writer.writerow(lead)
-            stats["auto_done"] += 1
+    ensure_partial_file(
+        fieldnames
+    )
 
-        out_f.flush()
-        if stats["auto_done"]:
-            print(f"⚡ {stats['auto_done']} instant leads done.\n")
+    with open(
+        PARTIAL_OUTPUT_FILE,
+        "a",
+        encoding="utf-8",
+        newline="",
+    ) as file:
 
-        for batch_idx in range(0, len(ai_leads), BATCH_SIZE):
-            batch     = ai_leads[batch_idx:batch_idx + BATCH_SIZE]
-            batch_num = batch_idx // BATCH_SIZE + 1
-            pct       = (batch_idx / len(ai_leads) * 100) if ai_leads else 100
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+        )
 
-            print(f"🤖 Batch {batch_num}/{total_batches}  |  {pct:.1f}%  |  {len(batch)} leads")
+        for row in rows:
+            writer.writerow(
+                row
+            )
 
-            mapping = process_batch_with_retry(batch, batch_num)
+        file.flush()
 
-            for i, lead in enumerate(batch):
-                domain  = lead.get("Domain", "")
-                ai_data = get_ai_result(mapping, domain, i)
-                lead["Pitch_Category"]   = ai_data["pitch"]
-                lead["Business_Type"]    = ai_data["biz"] or "Review Manually"
-                lead["Product_Category"] = ai_data["prod"] or "Review Manually"
-                writer.writerow(lead)
-                stats["processed"] += 1
 
-            out_f.flush()
-            elapsed = time.time() - start_time
-            eta     = int((elapsed / batch_num) * (total_batches - batch_num))
-            print(f"   ✅ ETA: ~{eta//60}m {eta%60}s | Skipped: {stats['ai_skipped']} | Retries: {stats['retries']} | RateLimits: {stats['rate_limit_hits']}")
+# ============================================================
+# FINALIZE OUTPUT
+# ============================================================
 
-            # ⬇️ NAYA: adaptive spacing — agar rate-limits lagatar lag rahe hain,
-            # to batches ke beech ka gap khud badhao (aur kabhi kam bhi karo jab sab smooth ho).
-            global current_batch_sleep
-            if consecutive_rate_limits >= 2:
-                current_batch_sleep = min(current_batch_sleep * 1.5, MAX_BATCH_SLEEP)
-            elif consecutive_rate_limits == 0 and current_batch_sleep > BASE_BATCH_SLEEP:
-                current_batch_sleep = max(current_batch_sleep * 0.9, BASE_BATCH_SLEEP)
-            time.sleep(current_batch_sleep)
+def finalize_output():
+    """
+    Only called when ALL leads have terminal results.
 
-    total_time = int(time.time() - start_time)
-    print("\n" + "=" * 60)
-    print("🎉 COMPLETE!")
-    print("=" * 60)
-    print(f"⚡ Instant       : {stats['auto_done']}")
-    print(f"🤖 AI done       : {stats['processed']}")
-    print(f"🧩 JSON fallback : {stats['json_fallback_saved']} (saved via single-lead retry)")
-    print(f"🚫 Skipped       : {stats['ai_skipped']}")
-    print(f"🔁 Real retries  : {stats['retries']}")
-    print(f"⏳ Rate limits   : {stats['rate_limit_hits']}")
-    print(f"⏱️  Time          : {total_time // 60}m {total_time % 60}s")
-    print("=" * 60)
+    Partial file becomes final atomically.
+    """
+
+    if not os.path.exists(
+        PARTIAL_OUTPUT_FILE
+    ):
+        return False
+
+    if os.path.getsize(
+        PARTIAL_OUTPUT_FILE
+    ) == 0:
+        return False
+
+    os.replace(
+        PARTIAL_OUTPUT_FILE,
+        OUTPUT_FILE,
+    )
+
+    return (
+        os.path.exists(
+            OUTPUT_FILE
+        )
+        and
+        os.path.getsize(
+            OUTPUT_FILE
+        ) > 0
+    )
+
+
+# ============================================================
+# DELETE STALE FINAL FILE
+# ============================================================
+
+def remove_stale_final_if_needed():
+    """
+    If there is a partial file, we are in an incomplete/resume
+    state. Do not let an old final CSV trick master_controller
+    into thinking this run is complete.
+
+    This function only removes a final file when a partial file
+    exists and there are still pending leads.
+    """
+
+    if not os.path.exists(
+        PARTIAL_OUTPUT_FILE
+    ):
+        return
+
+    # If final exists alongside a partial, final belongs to a
+    # previous incomplete/failed cycle. Remove it so controller
+    # won't falsely skip this stage.
+    if os.path.exists(
+        OUTPUT_FILE
+    ):
+
+        try:
+            os.remove(
+                OUTPUT_FILE
+            )
+
+            print(
+                "🧹 Removed stale final categorized file; "
+                "partial resume is active."
+            )
+
+        except OSError as exc:
+
+            print(
+                f"⚠️ Could not remove stale final: {exc}"
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    global current_batch_sleep
+
+    print()
+    print("=" * 72)
+    print(
+        "☁️ BAWA GROQ AI LEAD CATEGORIZER v3.0 FINAL"
+    )
+    print("=" * 72)
+    print()
+
+    # --------------------------------------------------------
+    # Basic validation
+    # --------------------------------------------------------
+
+    if not GROQ_API_KEY:
+
+        print(
+            "❌ GROQ_API_KEY set nahi hai."
+        )
+
+        return 1
+
+    if not os.path.exists(
+        INPUT_FILE
+    ):
+
+        print(
+            f"❌ '{INPUT_FILE}' nahi mila."
+        )
+
+        return 1
+
+    if not run_preflight_check():
+
+        return 1
+
+    # --------------------------------------------------------
+    # Load input
+    # --------------------------------------------------------
+
+    try:
+
+        all_leads, original_fields = (
+            load_csv_rows(
+                INPUT_FILE
+            )
+        )
+
+    except Exception as exc:
+
+        print(
+            f"❌ Input CSV read failed: "
+            f"{exc}"
+        )
+
+        return 1
+
+    if not all_leads:
+
+        print(
+            "⚠️ Input CSV mein koi leads nahi hain."
+        )
+
+        return 1
+
+    fieldnames = (
+        build_output_fieldnames(
+            original_fields
+        )
+    )
+
+    # --------------------------------------------------------
+    # Normalize + deduplicate input
+    # --------------------------------------------------------
+
+    unique_leads = []
+
+    seen_domains = set()
+
+    for lead in all_leads:
+
+        domain = normalize_domain(
+            lead.get(
+                "Domain",
+                ""
+            )
+        )
+
+        if not domain:
+            continue
+
+        if domain in seen_domains:
+            continue
+
+        seen_domains.add(
+            domain
+        )
+
+        lead[
+            "Domain"
+        ] = domain
+
+        unique_leads.append(
+            lead
+        )
+
+    all_leads = unique_leads
+
+    print(
+        f"📊 Unique input leads : "
+        f"{len(all_leads):,}"
+    )
+
+    # --------------------------------------------------------
+    # Resume state
+    # --------------------------------------------------------
+
+    processed_domains = set()
+
+    if os.path.exists(
+        OUTPUT_FILE
+    ):
+
+        processed_domains.update(
+            load_processed_domains(
+                OUTPUT_FILE
+            )
+        )
+
+    if os.path.exists(
+        PARTIAL_OUTPUT_FILE
+    ):
+
+        partial_domains = (
+            load_processed_domains(
+                PARTIAL_OUTPUT_FILE
+            )
+        )
+
+        processed_domains.update(
+            partial_domains
+        )
+
+    leads_to_process = [
+        lead
+        for lead in all_leads
+        if normalize_domain(
+            lead.get(
+                "Domain",
+                ""
+            )
+        )
+        not in processed_domains
+    ]
+
+    print(
+        f"⏭️ Already completed  : "
+        f"{len(processed_domains):,}"
+    )
+
+    print(
+        f"🎯 Pending           : "
+        f"{len(leads_to_process):,}"
+    )
+
+    # --------------------------------------------------------
+    # Nothing pending
+    # --------------------------------------------------------
+
+    if not leads_to_process:
+
+        # Existing final is already valid.
+        if (
+            os.path.exists(
+                OUTPUT_FILE
+            )
+            and
+            os.path.getsize(
+                OUTPUT_FILE
+            ) > 0
+        ):
+
+            print(
+                "✅ Final categorized file already complete."
+            )
+
+            return 0
+
+        # Partial contains everything.
+        if finalize_output():
+
+            print(
+                "✅ Partial output finalized."
+            )
+
+            return 0
+
+        print(
+            "❌ Nothing pending but no valid final output."
+        )
+
+        return 1
+
+    # --------------------------------------------------------
+    # Remove stale final if partial resume exists.
+    # --------------------------------------------------------
+
+    remove_stale_final_if_needed()
+
+    # --------------------------------------------------------
+    # Ensure partial output
+    # --------------------------------------------------------
+
+    ensure_partial_file(
+        fieldnames
+    )
+
+    # --------------------------------------------------------
+    # Instant classification groups
+    # --------------------------------------------------------
+
+    prelaunch = []
+
+    parked = []
+
+    no_data = []
+
+    ai_leads = []
+
+    for lead in leads_to_process:
+
+        if is_prelaunch(
+            lead
+        ):
+
+            prelaunch.append(
+                lead
+            )
+
+        elif is_parked(
+            lead
+        ):
+
+            parked.append(
+                lead
+            )
+
+        elif has_no_content(
+            lead
+        ):
+
+            no_data.append(
+                lead
+            )
+
+        else:
+
+            ai_leads.append(
+                lead
+            )
+
+    print()
+    print(
+        f"🔥 Pre-Launch : "
+        f"{len(prelaunch):,}"
+    )
+
+    print(
+        f"🅿️ Parked      : "
+        f"{len(parked):,}"
+    )
+
+    print(
+        f"⬛ No Content  : "
+        f"{len(no_data):,}"
+    )
+
+    print(
+        f"🤖 AI Pending  : "
+        f"{len(ai_leads):,}"
+    )
+
+    print(
+        "-" * 72
+    )
+
+    # ========================================================
+    # INSTANT PROCESSING
+    # ========================================================
+
+    instant_rows = []
+
+    # --------------------------------------------------------
+    # Pre-launch
+    # --------------------------------------------------------
+
+    for lead in prelaunch:
+
+        lead[
+            "Pitch_Category"
+        ] = "🔥 1. Pre-Launch"
+
+        lead[
+            "Business_Type"
+        ] = "Pre-Launch Brand"
+
+        lead[
+            "Product_Category"
+        ] = "Coming Soon"
+
+        instant_rows.append(
+            lead
+        )
+
+    # --------------------------------------------------------
+    # Parked
+    # --------------------------------------------------------
+
+    for lead in parked:
+
+        lead[
+            "Pitch_Category"
+        ] = "🟢 6. General Contacts"
+
+        lead[
+            "Business_Type"
+        ] = "Parked / Domain For Sale"
+
+        lead[
+            "Product_Category"
+        ] = "N/A"
+
+        instant_rows.append(
+            lead
+        )
+
+    # --------------------------------------------------------
+    # No content
+    # --------------------------------------------------------
+
+    for lead in no_data:
+
+        lead[
+            "Pitch_Category"
+        ] = "🟢 6. General Contacts"
+
+        lead[
+            "Business_Type"
+        ] = "No Content Found"
+
+        lead[
+            "Product_Category"
+        ] = "N/A"
+
+        instant_rows.append(
+            lead
+        )
+
+    if instant_rows:
+
+        append_partial_rows(
+            instant_rows,
+            fieldnames,
+        )
+
+        stats[
+            "auto_done"
+        ] += len(
+            instant_rows
+        )
+
+    # ========================================================
+    # AI PROCESSING
+    # ========================================================
+
+    total_batches = (
+        len(ai_leads)
+        + BATCH_SIZE
+        - 1
+    ) // BATCH_SIZE
+
+    for batch_start in range(
+        0,
+        len(ai_leads),
+        BATCH_SIZE,
+    ):
+
+        batch = ai_leads[
+            batch_start:
+            batch_start + BATCH_SIZE
+        ]
+
+        batch_num = (
+            batch_start
+            // BATCH_SIZE
+            + 1
+        )
+
+        percent = (
+            batch_start
+            / len(ai_leads)
+            * 100
+            if ai_leads
+            else 100
+        )
+
+        print()
+        print(
+            f"🤖 Batch "
+            f"{batch_num}/{total_batches} "
+            f"| {percent:.1f}% "
+            f"| {len(batch)} leads"
+        )
+
+        mapping = (
+            process_batch_with_retry(
+                batch,
+                batch_num,
+            )
+        )
+
+        if not mapping:
+            mapping = {}
+
+        successful_rows = []
+
+        unresolved_count = 0
+
+        for index, lead in enumerate(
+            batch
+        ):
+
+            result = mapping.get(
+                index
+            )
+
+            if result is None:
+
+                unresolved_count += 1
+
+                continue
+
+            lead[
+                "Pitch_Category"
+            ] = result[
+                "pitch"
+            ]
+
+            lead[
+                "Business_Type"
+            ] = result[
+                "biz"
+            ]
+
+            lead[
+                "Product_Category"
+            ] = result[
+                "prod"
+            ]
+
+            successful_rows.append(
+                lead
+            )
+
+        # ----------------------------------------------------
+        # Save only successful AI results.
+        # ----------------------------------------------------
+
+        if successful_rows:
+
+            append_partial_rows(
+                successful_rows,
+                fieldnames,
+            )
+
+            stats[
+                "ai_done"
+            ] += len(
+                successful_rows
+            )
+
+            stats[
+                "processed"
+            ] += len(
+                successful_rows
+            )
+
+        # ----------------------------------------------------
+        # Unresolved leads remain pending.
+        # ----------------------------------------------------
+
+        if unresolved_count:
+
+            stats[
+                "pending"
+            ] += unresolved_count
+
+            print(
+                f"   ⚠️ "
+                f"{unresolved_count}/"
+                f"{len(batch)} leads remain "
+                f"UNRESOLVED and will be retried "
+                f"on the next run."
+            )
+
+        # ----------------------------------------------------
+        # Adaptive batch sleep
+        # ----------------------------------------------------
+
+        if (
+            consecutive_rate_limits
+            >= 2
+        ):
+
+            current_batch_sleep = min(
+                current_batch_sleep
+                * 1.5,
+                MAX_BATCH_SLEEP,
+            )
+
+        elif (
+            consecutive_rate_limits
+            == 0
+            and current_batch_sleep
+            > BASE_BATCH_SLEEP
+        ):
+
+            current_batch_sleep = max(
+                current_batch_sleep
+                * 0.9,
+                BASE_BATCH_SLEEP,
+            )
+
+        time.sleep(
+            current_batch_sleep
+        )
+
+    # ========================================================
+    # FINAL COMPLETION CHECK
+    # ========================================================
+
+    final_processed = load_processed_domains(
+        PARTIAL_OUTPUT_FILE
+    )
+
+    remaining_domains = []
+
+    for lead in all_leads:
+
+        domain = normalize_domain(
+            lead.get(
+                "Domain",
+                ""
+            )
+        )
+
+        if domain not in final_processed:
+
+            remaining_domains.append(
+                domain
+            )
+
+    remaining_count = len(
+        remaining_domains
+    )
+
+    total_time = 0
+
+    print()
+    print("=" * 72)
+    print(
+        "📊 CATEGORIZER RUN SUMMARY"
+    )
+    print("=" * 72)
+
+    print(
+        f"⚡ Auto processed    : "
+        f"{stats['auto_done']:,}"
+    )
+
+    print(
+        f"🤖 AI processed      : "
+        f"{stats['ai_done']:,}"
+    )
+
+    print(
+        f"🧩 Single fallbacks  : "
+        f"{stats['single_fallback_saved']:,}"
+    )
+
+    print(
+        f"🔁 Retries           : "
+        f"{stats['retries']:,}"
+    )
+
+    print(
+        f"⏳ Rate limits       : "
+        f"{stats['rate_limit_hits']:,}"
+    )
+
+    print(
+        f"⚠️ Pending unresolved: "
+        f"{remaining_count:,}"
+    )
+
+    print(
+        f"📁 Partial output    : "
+        f"{PARTIAL_OUTPUT_FILE}"
+    )
+
+    print()
+
+    # ========================================================
+    # COMPLETE
+    # ========================================================
+
+    if remaining_count == 0:
+
+        if finalize_output():
+
+            print(
+                "🎉 ALL LEADS CATEGORIZED SUCCESSFULLY!"
+            )
+
+            print(
+                f"📁 Final output: "
+                f"{OUTPUT_FILE}"
+            )
+
+            print("=" * 72)
+
+            return 0
+
+        print(
+            "❌ All leads processed, "
+            "but finalization failed."
+        )
+
+        return 1
+
+    # ========================================================
+    # INCOMPLETE
+    # ========================================================
+
+    print(
+        "⚠️ Categorizer incomplete."
+    )
+
+    print(
+        "   Partial results safely saved."
+    )
+
+    print(
+        "   Next run will resume only unresolved leads."
+    )
+
+    print(
+        "   Final CSV will NOT be created until "
+        "everything is complete."
+    )
+
+    print("=" * 72)
+
+    # IMPORTANT:
+    # Return non-zero so master controller knows this stage
+    # did not finish successfully.
+    return 1
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        main()
+    )
+```
