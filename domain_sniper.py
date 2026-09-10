@@ -1,4 +1,3 @@
-```python
 import os
 import sys
 import time
@@ -13,7 +12,7 @@ from bs4 import BeautifulSoup
 
 
 # ============================================================
-# BAWA DOMAIN SNIPER v2.1
+# BAWA DOMAIN SNIPER v2.2 (FIXED)
 # ------------------------------------------------------------
 # Features:
 #   ✅ Historical missing-date recovery
@@ -28,6 +27,17 @@ from bs4 import BeautifulSoup
 #   ✅ Atomic final file replacement
 #   ✅ Zero-byte / broken-file protection
 #   ✅ Temp cleanup
+#
+# v2.2 FIX (over v2.1):
+#   process_date() used to build/clean its temp workspace
+#   (safe_remove / rmtree / os.makedirs) OUTSIDE the try block.
+#   If that raised an OSError (disk full, permissions, weird
+#   filesystem state), the exception would bubble all the way
+#   up to sync_historical_whois_data()'s outer try/except and
+#   get logged as a FATAL error — aborting the ENTIRE run and
+#   skipping every remaining date, not just the bad one. Now
+#   that setup/cleanup is inside process_date's own try/except,
+#   so a single date's filesystem hiccup only fails that date.
 # ============================================================
 
 
@@ -785,90 +795,20 @@ def process_date(
         f".extract_{date_str}"
     )
 
-    # Clean stale temporary artifacts
-    safe_remove(
-        zip_file_path
-    )
-
-    if os.path.exists(
-        extract_workspace
-    ):
-        shutil.rmtree(
-            extract_workspace,
-            ignore_errors=True
-        )
-
-    os.makedirs(
-        extract_workspace,
-        exist_ok=True
-    )
+    # ----------------------------------------------------------
+    # v2.2 FIX: everything from workspace prep to cleanup is now
+    # inside ONE try/except OSError. Previously, safe_remove()/
+    # rmtree()/os.makedirs() ran outside any try block here — an
+    # OSError from any of them (disk full, permission denied,
+    # weird filesystem state) would propagate all the way up and
+    # be treated as a FATAL error by the caller, aborting the
+    # entire sync run (all remaining dates too). Now a filesystem
+    # problem on one date only fails that one date.
+    # ----------------------------------------------------------
 
     try:
 
-        # ----------------------------------------------------
-        # Download
-        # ----------------------------------------------------
-
-        if not download_zip(
-            scraper,
-            download_url,
-            zip_file_path,
-        ):
-
-            log(
-                f"[-] {date_str}: download failed."
-            )
-
-            return False
-
-        # ----------------------------------------------------
-        # Extract
-        # ----------------------------------------------------
-
-        log(
-            f"[+] Extracting {date_str}..."
-        )
-
-        extracted_file = (
-            safe_extract_first_data_file(
-                zip_file_path,
-                extract_workspace,
-            )
-        )
-
-        if not extracted_file:
-
-            log(
-                f"[-] {date_str}: extraction failed."
-            )
-
-            return False
-
-        # ----------------------------------------------------
-        # Finalize
-        # ----------------------------------------------------
-
-        if finalize_extracted_file(
-            extracted_file,
-            expected_filepath,
-        ):
-
-            log(
-                f"[+] SUCCESS: "
-                f"{os.path.basename(expected_filepath)} "
-                f"saved ✅"
-            )
-
-            return True
-
-        log(
-            f"[-] {date_str}: finalization failed."
-        )
-
-        return False
-
-    finally:
-
+        # Clean stale temporary artifacts
         safe_remove(
             zip_file_path
         )
@@ -880,6 +820,98 @@ def process_date(
                 extract_workspace,
                 ignore_errors=True
             )
+
+        os.makedirs(
+            extract_workspace,
+            exist_ok=True
+        )
+
+        try:
+
+            # ----------------------------------------------------
+            # Download
+            # ----------------------------------------------------
+
+            if not download_zip(
+                scraper,
+                download_url,
+                zip_file_path,
+            ):
+
+                log(
+                    f"[-] {date_str}: download failed."
+                )
+
+                return False
+
+            # ----------------------------------------------------
+            # Extract
+            # ----------------------------------------------------
+
+            log(
+                f"[+] Extracting {date_str}..."
+            )
+
+            extracted_file = (
+                safe_extract_first_data_file(
+                    zip_file_path,
+                    extract_workspace,
+                )
+            )
+
+            if not extracted_file:
+
+                log(
+                    f"[-] {date_str}: extraction failed."
+                )
+
+                return False
+
+            # ----------------------------------------------------
+            # Finalize
+            # ----------------------------------------------------
+
+            if finalize_extracted_file(
+                extracted_file,
+                expected_filepath,
+            ):
+
+                log(
+                    f"[+] SUCCESS: "
+                    f"{os.path.basename(expected_filepath)} "
+                    f"saved ✅"
+                )
+
+                return True
+
+            log(
+                f"[-] {date_str}: finalization failed."
+            )
+
+            return False
+
+        finally:
+
+            safe_remove(
+                zip_file_path
+            )
+
+            if os.path.exists(
+                extract_workspace
+            ):
+                shutil.rmtree(
+                    extract_workspace,
+                    ignore_errors=True
+                )
+
+    except OSError as exc:
+
+        log(
+            f"[-] {date_str}: filesystem error while "
+            f"preparing/cleaning workspace: {exc}"
+        )
+
+        return False
 
 
 # ============================================================
@@ -1187,4 +1219,3 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     raise SystemExit(0)
-```
