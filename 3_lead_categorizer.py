@@ -1,4 +1,3 @@
-```python
 import csv
 import json
 import os
@@ -11,7 +10,7 @@ import requests
 
 
 # ============================================================
-# BAWA AI LEAD CATEGORIZER v3.0 FINAL
+# BAWA AI LEAD CATEGORIZER v3.1 (FIXED)
 # ------------------------------------------------------------
 # INPUT:
 #   Ultimate_God_Leads.csv
@@ -26,23 +25,20 @@ import requests
 #   Website X-Ray data ko AI se classify karke final lead
 #   categories generate karna.
 #
-# MAJOR IMPROVEMENTS:
-#   ✅ Strict JSON Schema
-#   ✅ GPT-OSS 20B structured output
-#   ✅ Partial-output resume
-#   ✅ Atomic finalization
-#   ✅ Failed AI leads remain pending
-#   ✅ No fake "Review Manually" completion
-#   ✅ Batch + single-lead fallback
-#   ✅ Rate-limit aware retry
-#   ✅ Adaptive batch delay
-#   ✅ Model preflight validation
-#   ✅ Input/output schema validation
-#   ✅ Canonical pitch generation
-#   ✅ Duplicate-domain protection
-#   ✅ AI response validation
-#   ✅ Safer JSON parsing
-#   ✅ Existing pipeline-compatible columns
+# v3.1 FIX (over v3.0):
+#   get_retry_after() used to clamp Groq's Retry-After header to
+#   a max of 120s. If Groq ever returns a 429 because of a HARD
+#   quota wall (e.g. daily token quota exhausted, real
+#   Retry-After could be hours), the old code would silently
+#   treat it as "wait 120s" and burn through MAX_RATE_LIMIT_RETRIES
+#   (8) short waits — then still fall into the single-lead
+#   fallback loop and hit the same wall again per lead. That
+#   wastes a lot of run time for something retries can't fix.
+#   Now: if Retry-After is large (> RATE_LIMIT_HARD_WALL_SECONDS),
+#   we treat it as a hard quota wall, log it clearly, and bail
+#   out of BOTH batch retries and single-lead fallback for this
+#   run immediately — leads stay safely pending for the next run
+#   instead of the script spinning uselessly.
 # ============================================================
 
 
@@ -94,6 +90,11 @@ MAX_RATE_LIMIT_RETRIES = 8
 
 SINGLE_LEAD_FALLBACK = True
 
+# If Groq's Retry-After is bigger than this, it's almost
+# certainly a hard quota wall (daily/monthly limit), not a
+# short burst limit — retrying won't help within this run.
+RATE_LIMIT_HARD_WALL_SECONDS = 300
+
 
 # ------------------------------------------------------------
 # Timing
@@ -108,6 +109,11 @@ current_batch_sleep = (
 )
 
 consecutive_rate_limits = 0
+
+# Set once we detect a hard quota wall so the rest of this run
+# can stop attempting AI calls entirely instead of retrying
+# batch after batch into the same wall.
+quota_exhausted = False
 
 
 # ------------------------------------------------------------
@@ -934,6 +940,12 @@ def api_headers():
 
 # ============================================================
 # SAFE RETRY-AFTER PARSER
+# ------------------------------------------------------------
+# v3.1 FIX: no longer clamps to a tiny 120s ceiling. We need the
+# real value to tell a short burst-limit apart from a long hard
+# quota wall (see RATE_LIMIT_HARD_WALL_SECONDS usage below). We
+# still cap at 24h just to guard against a garbage header value
+# causing an absurd sleep somewhere else in the code.
 # ============================================================
 
 def get_retry_after(
@@ -951,7 +963,7 @@ def get_retry_after(
             1,
             min(
                 int(float(value)),
-                120,
+                86400,
             )
         )
     except (
@@ -1390,6 +1402,7 @@ def categorize_batch_with_ai(
         return {
             "status": "RATE_LIMITED",
             "retry_after": retry_after,
+            "body": response.text[:500],
         }
 
     # ========================================================
@@ -1485,7 +1498,16 @@ def categorize_single_lead(
 ):
     """
     Retry one problematic lead independently.
+
+    v3.1: skipped entirely if we've already detected a hard
+    quota wall this run (see quota_exhausted flag) — a single
+    lead can't succeed where a batch just hit a hard wall.
     """
+
+    global quota_exhausted
+
+    if quota_exhausted:
+        return None
 
     stats[
         "single_fallback_attempts"
@@ -1494,6 +1516,27 @@ def categorize_single_lead(
     result = categorize_batch_with_ai(
         [lead]
     )
+
+    if result.get(
+        "status"
+    ) == "RATE_LIMITED":
+
+        retry_after = result.get(
+            "retry_after",
+            15,
+        )
+
+        if retry_after > RATE_LIMIT_HARD_WALL_SECONDS:
+
+            quota_exhausted = True
+
+            print(
+                f"   🛑 Quota wall hit again during single-lead "
+                f"fallback (Retry-After={retry_after}s). "
+                f"Stopping fallback for remaining leads."
+            )
+
+        return None
 
     if result.get(
         "status"
@@ -1522,6 +1565,12 @@ def process_batch_with_retry(
 
     global current_batch_sleep
     global consecutive_rate_limits
+    global quota_exhausted
+
+    # If a previous batch this run already confirmed a hard
+    # quota wall, don't even try — just leave this batch pending.
+    if quota_exhausted:
+        return {}
 
     real_attempts = 0
 
@@ -1564,16 +1613,44 @@ def process_batch_with_retry(
 
         if status == "RATE_LIMITED":
 
+            retry_after = result.get(
+                "retry_after",
+                15,
+            )
+
+            # --------------------------------------------------
+            # v3.1 FIX: a large Retry-After means a hard quota
+            # wall (daily/monthly limit), not a short burst
+            # limit. Retrying with short waits just wastes time
+            # and hits the same wall again and again. Bail out
+            # immediately instead of burning through
+            # MAX_RATE_LIMIT_RETRIES and then the fallback loop.
+            # --------------------------------------------------
+
+            if retry_after > RATE_LIMIT_HARD_WALL_SECONDS:
+
+                quota_exhausted = True
+
+                print(
+                    f"   🛑 Groq Retry-After={retry_after}s — "
+                    f"this looks like a hard quota wall, not a "
+                    f"short rate limit. Stopping AI calls for "
+                    f"this run; all remaining leads stay pending "
+                    f"and will be retried on the next run."
+                )
+
+                print(
+                    f"   ↳ Body: "
+                    f"{result.get('body', '')[:300]}"
+                )
+
+                return {}
+
             rate_limit_attempts += 1
 
             stats[
                 "retries"
             ] += 1
-
-            retry_after = result.get(
-                "retry_after",
-                15,
-            )
 
             # Small jitter avoids repeatedly hitting the exact
             # same boundary.
@@ -1632,7 +1709,7 @@ def process_batch_with_retry(
     # SINGLE-LEAD FALLBACK
     # ========================================================
 
-    if not SINGLE_LEAD_FALLBACK:
+    if not SINGLE_LEAD_FALLBACK or quota_exhausted:
 
         return {}
 
@@ -1646,6 +1723,9 @@ def process_batch_with_retry(
     for index, lead in enumerate(
         batch
     ):
+
+        if quota_exhausted:
+            break
 
         result = categorize_single_lead(
             lead
@@ -1963,7 +2043,7 @@ def main():
     print()
     print("=" * 72)
     print(
-        "☁️ BAWA GROQ AI LEAD CATEGORIZER v3.0 FINAL"
+        "☁️ BAWA GROQ AI LEAD CATEGORIZER v3.1 (FIXED)"
     )
     print("=" * 72)
     print()
@@ -2345,6 +2425,18 @@ def main():
         BATCH_SIZE,
     ):
 
+        # If a hard quota wall was already detected, stop
+        # launching new batches entirely — they'll just fail the
+        # same way. Remaining leads stay pending for next run.
+        if quota_exhausted:
+
+            print(
+                "🛑 Quota wall active — skipping remaining "
+                "batches for this run."
+            )
+
+            break
+
         batch = ai_leads[
             batch_start:
             batch_start + BATCH_SIZE
@@ -2524,8 +2616,6 @@ def main():
         remaining_domains
     )
 
-    total_time = 0
-
     print()
     print("=" * 72)
     print(
@@ -2562,6 +2652,13 @@ def main():
         f"⚠️ Pending unresolved: "
         f"{remaining_count:,}"
     )
+
+    if quota_exhausted:
+
+        print(
+            "🛑 Quota wall        : HIT — stopped early, "
+            "resume on next run once quota resets."
+        )
 
     print(
         f"📁 Partial output    : "
@@ -2635,4 +2732,3 @@ if __name__ == "__main__":
     raise SystemExit(
         main()
     )
-```
