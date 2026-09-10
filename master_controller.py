@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 
 # ============================================================
-# BAWA MASTER CONTROLLER v2.2
+# BAWA MASTER CONTROLLER v2.3
 # Compatible with:
 #   1) domain_sniper.py v2.2
 #   2) 1_domain_filter.py v3.1
@@ -16,7 +16,8 @@ from datetime import datetime
 #   4) 3_lead_categorizer.py v3.1
 #
 # Design:
-#   - One active date at a time
+#   - Raw WhoisDS sync is independent from the active processing date
+#   - One active processing date at a time
 #   - Date lock controls resume
 #   - No outer retry storm for X-Ray
 #   - X-Ray owns HTTP retries + SUCCESS/DEAD cache semantics
@@ -24,6 +25,8 @@ from datetime import datetime
 #   - Non-zero categorizer exit never deletes partial work
 #   - Final CSV is archived only after a real final output exists
 #   - All paths are repo-relative / GitHub Actions safe
+#   - Raw harvesting never gets blocked by an old date's AI quota pause
+#   - Raw harvest runs once per controller run, not once per backlog date
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -352,57 +355,99 @@ def is_valid_archive(path):
 
 
 # ============================================================
-# STEP 1 — SNIPER
+# RAW DATA HARVEST — INDEPENDENT FROM DATE PROCESSING
 # ============================================================
 
-def run_sniper_for_date(target_date_str):
+def run_raw_sync(run_start):
     """
-    IMPORTANT:
-    v2.2 sniper supports CLI target date. Pass it explicitly so the
-    controller and sniper agree on exactly which date must be present.
+    Refresh daily_domains/ independently of the currently active processing date.
+
+    The v2.2 controller only launched Sniper as part of fire_the_pipeline().
+    That meant a paused old date (for example, a Groq quota wall on 2026-07-30)
+    could prevent newer WhoisDS raw dates from ever being harvested.
+
+    v2.3 fixes that by running the Sniper in its standalone full-history mode
+    at the beginning of every controller run. The sniper itself skips healthy
+    files and downloads only missing dates.
+
+    This is best-effort: a Sniper failure must NOT block processing of raw data
+    that is already present in daily_domains/.
     """
-    log(
-        "STEP 1: Firing Sniper "
-        f"(historical sync + target-date verification: {target_date_str})..."
-    )
+    log("RAW SYNC: Refreshing WhoisDS history independently of active pipeline date...")
+
+    if not require_stage_budget(run_start, "WhoisDS Raw Sync", SNIPER_TIMEOUT):
+        log("⏭️ Raw sync skipped because the remaining controller budget is too small.")
+        return "PAUSED"
 
     if not check_internet():
-        log("⚠️ Internet unavailable before Sniper.")
+        log("⚠️ Internet unavailable before Raw Sync. Existing raw data will still be processed.")
         return "PAUSED"
 
     try:
+        # No target date => domain_sniper.py v2.2 enters full-history mode.
         subprocess.run(
-            [PYTHON, SNIPER_SCRIPT, target_date_str],
+            [PYTHON, SNIPER_SCRIPT],
             check=True,
             cwd=BASE_DIR,
             timeout=SNIPER_TIMEOUT,
         )
+        log("✅ Raw WhoisDS sync finished.")
+        return "SUCCESS"
     except subprocess.TimeoutExpired:
-        log("❌ Sniper timed out. Keeping date lock for next run.")
+        log("⏱️ Raw WhoisDS sync timed out. Any successfully finalized dates remain saved.")
         return "PAUSED"
     except subprocess.CalledProcessError as exc:
-        log(f"❌ Sniper exited with code {exc.returncode}. Keeping state.")
+        log(
+            f"⚠️ Raw WhoisDS sync exited with code {exc.returncode}. "
+            "Continuing with whatever raw data is already available."
+        )
         return "ERROR"
     except OSError as exc:
-        log(f"❌ Could not launch Sniper: {exc}")
+        log(f"⚠️ Could not launch Raw WhoisDS sync: {exc}. Continuing with existing data.")
         return "ERROR"
 
-    downloaded_file = find_raw_file(target_date_str)
+
+# ============================================================
+# STEP 1 — RAW INPUT PREPARATION
+# ============================================================
+
+def prepare_raw_input_for_date(target_date_str, is_resume=False):
+    """
+    Prepare state/domain-names.txt from the already-harvested daily_domains file.
+
+    Sniper is intentionally NOT launched here. Raw harvesting is handled once
+    per controller run by run_raw_sync(), independent of the processing lock.
+    """
+    target_raw = find_raw_file(target_date_str)
     target_input = state_path(RAW_INPUT_FILE)
 
-    if not downloaded_file:
+    if os.path.exists(target_input):
         log(
-            f"ℹ️ Raw WhoisDS file for {target_date_str} is not available yet."
+            "STEP 1: Existing domain-names.txt found — "
+            "using existing state instead of replacing it."
         )
-        return "MISSING"
-
-    try:
-        shutil.copy2(downloaded_file, target_input)
-        log(f"✅ Raw data piped for {target_date_str}: {downloaded_file}")
         return "SUCCESS"
-    except OSError as exc:
-        log(f"❌ Could not copy raw data into state: {exc}")
-        return "ERROR"
+
+    if target_raw and os.path.isfile(target_raw):
+        try:
+            shutil.copy2(target_raw, target_input)
+            if is_resume:
+                log(
+                    f"STEP 1: Resume recovered raw input from {target_raw}."
+                )
+            else:
+                log(
+                    f"STEP 1: Raw input piped from harvested file: {target_raw}"
+                )
+            return "SUCCESS"
+        except OSError as exc:
+            log(f"❌ Could not copy raw data into state: {exc}")
+            return "ERROR"
+
+    log(
+        f"ℹ️ Raw WhoisDS file for {target_date_str} is not present in daily_domains/."
+    )
+    return "MISSING"
 
 
 # ============================================================
@@ -634,45 +679,25 @@ def fire_the_pipeline(target_date_str, is_resume=False, run_start=None):
         log("⏱️ Not enough run budget left to start another stage.")
         return "PAUSED"
 
-    # ---------------- STEP 1: SNIPER ----------------
-    # On resume, existing state is authoritative. Do not re-run Sniper
-    # against a partially processed date.
-    if not is_resume:
-        if not os.path.exists(state_path(RAW_INPUT_FILE)):
-            if not require_stage_budget(run_start, "Sniper", SNIPER_TIMEOUT):
-                return "PAUSED"
-            sniper_status = run_sniper_for_date(target_date_str)
+    # ---------------- STEP 1: RAW INPUT ----------------
+    # Raw harvesting is now independent. At this point we only copy the
+    # already-downloaded target date into the active state workspace.
+    raw_status = prepare_raw_input_for_date(
+        target_date_str,
+        is_resume=is_resume,
+    )
 
-            if sniper_status == "MISSING":
-                log(
-                    f"ℹ️ WhoisDS has not exposed usable data for "
-                    f"{target_date_str} yet."
-                )
-                remove_file(DATE_LOCK_FILE)
-                return "MISSING"
+    if raw_status == "MISSING":
+        # Upstream data is simply not available yet. This is normal for a
+        # brand-new date and should not leave a stale processing lock behind.
+        log(
+            f"ℹ️ WhoisDS raw data for {target_date_str} is not available yet."
+        )
+        remove_file(DATE_LOCK_FILE)
+        return "MISSING"
 
-            if sniper_status != "SUCCESS":
-                return sniper_status
-        else:
-            log(
-                "STEP 1: Existing domain-names.txt found — "
-                "using existing state instead of re-running Sniper."
-            )
-    else:
-        if os.path.exists(state_path(RAW_INPUT_FILE)):
-            log("STEP 1: Resume — existing raw input preserved.")
-        else:
-            # A resume without raw input is not safely resumable.
-            log(
-                "⚠️ Resume requested but domain-names.txt is missing. "
-                "Attempting target-date Sniper recovery..."
-            )
-            if not require_stage_budget(run_start, "Sniper", SNIPER_TIMEOUT):
-                return "PAUSED"
-            sniper_status = run_sniper_for_date(target_date_str)
-
-            if sniper_status != "SUCCESS":
-                return sniper_status
+    if raw_status != "SUCCESS":
+        return raw_status
 
     # ---------------- STEP 2: FILTER 1 ----------------
     if not os.path.exists(state_path(FILTER_1_OUTPUT)):
@@ -745,11 +770,12 @@ def clean_invalid_archive(target_date_str):
 
 def main():
     log("============================================================")
-    log("BAWA MASTER CONTROLLER v2.1 ONLINE")
+    log("BAWA MASTER CONTROLLER v2.3 ONLINE")
     log("Single-run / bounded-budget / resume-safe mode")
     log("============================================================")
 
     run_start = time.time()
+    raw_sync_attempted = False
 
     while True:
         if not within_budget(run_start):
@@ -765,6 +791,24 @@ def main():
                 "exiting this run without destroying state."
             )
             break
+
+        # ----------------------------------------------------
+        # RAW HARVEST (independent from processing state)
+        # ----------------------------------------------------
+        # IMPORTANT: Do this once per controller run, before resume/backlog
+        # processing, so a paused old date cannot freeze acquisition of newer
+        # WhoisDS dates. Do NOT repeat it after a successful backlog date in
+        # the same run; the raw sync has already refreshed daily_domains/.
+        if not raw_sync_attempted:
+            raw_sync_attempted = True
+            raw_sync_result = run_raw_sync(run_start)
+            if raw_sync_result != "SUCCESS":
+                log(
+                    f"ℹ️ Raw sync returned {raw_sync_result}; "
+                    "continuing with all raw data already present locally."
+                )
+        else:
+            log("RAW SYNC: Already attempted this controller run — skipping duplicate sync.")
 
         # ----------------------------------------------------
         # SCENARIO 1: ACTIVE / DIRTY WORKSPACE
