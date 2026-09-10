@@ -5,7 +5,7 @@ from collections import defaultdict
 
 
 # ============================================================
-# BAWA DOMAIN FILTER v3.0
+# BAWA DOMAIN FILTER v3.1 (FIXED)
 # ------------------------------------------------------------
 # INPUT:
 #   domain-names.txt
@@ -17,22 +17,14 @@ from collections import defaultdict
 #   premium_domains.txt mein ONLY domain names likhe jaate hain.
 #   Score/reason internal ranking ke liye use hote hain.
 #
-# FEATURES:
-#   ✅ Strict domain normalization
-#   ✅ Duplicate removal
-#   ✅ Multi-TLD support
-#   ✅ Longest-TLD matching (.co.in before .in)
-#   ✅ Smart keyword scoring
-#   ✅ Short keyword false-positive protection
-#   ✅ Length scoring
-#   ✅ Number/hyphen penalties
-#   ✅ Brandability heuristics
-#   ✅ Commercial intent scoring
-#   ✅ Suspicious pattern filtering
-#   ✅ Score-based ranking
-#   ✅ Atomic output writing
-#   ✅ Streaming input processing
-#   ✅ Compatible with existing X-Ray scanner
+# v3.1 FIX (over v3.0):
+#   TLD/length/brandability points alone were enough to cross
+#   MIN_PREMIUM_SCORE (e.g. a random short .com easily scored
+#   90+ with ZERO keyword match). That defeated the entire
+#   purpose of the niche dictionary. Now a domain MUST match
+#   at least one real keyword to qualify — TLD/length/brand
+#   scores only affect RANKING among already-qualified domains,
+#   they no longer act as a gate by themselves.
 # ============================================================
 
 
@@ -66,6 +58,8 @@ MAX_OUTPUT_DOMAINS = None
 # TARGET TLDS
 # ------------------------------------------------------------
 # Score is a heuristic, not an actual resale valuation.
+# NOTE: since v3.1 requires a keyword match to qualify anyway,
+# TLD score here only affects ranking/order, not eligibility.
 # ============================================================
 
 TLD_SCORES = {
@@ -166,7 +160,6 @@ KEYWORDS = {
         "sync": 14,
         "flow": 14,
         "platform": 18,
-        "software": 18,
     },
 
     "AI": {
@@ -880,7 +873,14 @@ def score_domain(domain):
     """
     Calculate complete lead score.
 
-    Returns dictionary containing internal ranking data.
+    Returns dictionary containing internal ranking data, or
+    None if the domain is structurally invalid.
+
+    NOTE: this function does NOT decide eligibility by itself
+    anymore (except structural validity). The caller (main)
+    enforces the "must have a real keyword match" gate using
+    the returned "keyword_score" field. This keeps scoring and
+    eligibility concerns separate and auditable.
     """
 
     normalized = normalize_domain(
@@ -1064,7 +1064,7 @@ def main():
 
     print()
     print("=" * 72)
-    print("💎 BAWA DOMAIN FILTER v3.0")
+    print("💎 BAWA DOMAIN FILTER v3.1 (FIXED)")
     print("=" * 72)
     print()
 
@@ -1087,6 +1087,7 @@ def main():
     empty_lines = 0
     duplicates = 0
     invalid_domains = 0
+    rejected_no_keyword = 0
     rejected_low_score = 0
     premium_count = 0
 
@@ -1160,6 +1161,21 @@ def main():
                 if not result:
 
                     invalid_domains += 1
+                    continue
+
+                # ------------------------------------------------
+                # HARD GATE (the actual fix):
+                # A domain MUST match at least one real keyword to
+                # qualify. TLD/length/brandability alone can no
+                # longer push a domain over the line — they only
+                # affect ranking among domains that already passed
+                # this gate. This is what makes the niche
+                # dictionary actually matter.
+                # ------------------------------------------------
+
+                if result["keyword_score"] <= 0:
+
+                    rejected_no_keyword += 1
                     continue
 
                 # ------------------------------------------------
@@ -1264,30 +1280,34 @@ def main():
     report_lines = []
 
     report_lines.append(
-        "BAWA DOMAIN FILTER v3.0 REPORT\n"
+        "BAWA DOMAIN FILTER v3.1 REPORT\n"
     )
     report_lines.append(
         "=" * 90 + "\n"
     )
 
     report_lines.append(
-        f"Total scanned      : {total_scanned:,}\n"
+        f"Total scanned        : {total_scanned:,}\n"
     )
 
     report_lines.append(
-        f"Duplicates removed : {duplicates:,}\n"
+        f"Duplicates removed   : {duplicates:,}\n"
     )
 
     report_lines.append(
-        f"Invalid domains    : {invalid_domains:,}\n"
+        f"Invalid domains      : {invalid_domains:,}\n"
     )
 
     report_lines.append(
-        f"Low-score rejected : {rejected_low_score:,}\n"
+        f"Rejected (no keyword): {rejected_no_keyword:,}\n"
     )
 
     report_lines.append(
-        f"Premium selected   : {premium_count:,}\n"
+        f"Rejected (low score) : {rejected_low_score:,}\n"
+    )
+
+    report_lines.append(
+        f"Premium selected     : {premium_count:,}\n"
     )
 
     report_lines.append(
@@ -1358,37 +1378,42 @@ def main():
     )
 
     print(
-        f"📊 Domains scanned      : "
+        f"📊 Domains scanned        : "
         f"{total_scanned:,}"
     )
 
     print(
-        f"♻️ Duplicates removed   : "
+        f"♻️ Duplicates removed     : "
         f"{duplicates:,}"
     )
 
     print(
-        f"❌ Invalid domains      : "
+        f"❌ Invalid domains        : "
         f"{invalid_domains:,}"
     )
 
     print(
-        f"🗑️ Low-score rejected   : "
+        f"🚫 Rejected (no keyword)  : "
+        f"{rejected_no_keyword:,}"
+    )
+
+    print(
+        f"🗑️ Rejected (low score)   : "
         f"{rejected_low_score:,}"
     )
 
     print(
-        f"💎 Premium selected     : "
+        f"💎 Premium selected       : "
         f"{premium_count:,}"
     )
 
     print(
-        f"📁 Pipeline output      : "
+        f"📁 Pipeline output        : "
         f"{OUTPUT_FILE}"
     )
 
     print(
-        f"📋 Ranking report       : "
+        f"📋 Ranking report         : "
         f"{REPORT_FILE}"
     )
 
