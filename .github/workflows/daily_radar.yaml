@@ -2,74 +2,136 @@ name: 🚀 Bawa Cloud Engine Auto-Pilot
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # roz subah 2:00 AM UTC
-  workflow_dispatch:      # manual "Run workflow" button
+    - cron: '0 2 * * *'   # Daily 2:00 AM UTC
+  workflow_dispatch:       # Manual Run workflow
 
 permissions:
-  contents: write   # zaroori hai raw + final data ko wapas commit karne ke liye
+  contents: write
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 340   # ~5h40m — GitHub Actions ki 6hr hard-limit se pehle hi khatam ho jaaye
+
+    # GitHub job ceiling ~6h.
+    # Controller itself uses ~5.5h budget + internal safety reserve.
+    timeout-minutes: 340
 
     steps:
+
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
+
+      # ============================================================
+      # 2. PYTHON
+      # ============================================================
       - name: 🐍 Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
+
+      # ============================================================
+      # 3. DEPENDENCIES
+      # ============================================================
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🧠 Sirf beech-ki-scratch working state (ek date ke process hone
-      # tak zinda rehne wali files) cache me rakhte hai — taaki agar job
-      # timeout ho jaaye toh next run wahi se resume kar sake.
-      - name: ♻️ Restore in-progress state cache
+
+      # ============================================================
+      # 4. RESTORE PIPELINE QUEUE STATE
+      # ------------------------------------------------------------
+      # v3 QUEUE ARCHITECTURE:
+      #
+      # processing_queue/
+      #   Per-date X-Ray workspaces
+      #
+      # ai_queue/
+      #   Global AI queue
+      #   Canonical categorized partial registry
+      #
+      # state/
+      #   Kept for legacy migration / compatibility only.
+      # ============================================================
+      - name: ♻️ Restore Pipeline Queue State
         uses: actions/cache@v4
         with:
-          path: state
+          path: |
+            processing_queue
+            ai_queue
+            state
           key: pipeline-state-${{ github.run_id }}
           restore-keys: |
             pipeline-state-
 
+
+      # ============================================================
+      # 5. FIRE MASTER CONTROLLER
+      # ============================================================
       - name: 🔥 Fire The Master Controller
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          MAX_RUNTIME_SECONDS: "19800"   # 5.5h budget for the pipeline loop itself
+
+          # Controller-wide run budget:
+          # 5h 30m
+          MAX_RUNTIME_SECONDS: "19800"
+
+          # Keep 60 seconds reserved for graceful shutdown/state save.
+          SAFETY_RESERVE_SECONDS: "60"
+
         run: |
           python master_controller.py
 
-      # 📌 Dono cheezein permanently git me commit-back karo — jaisa
-      # original PC-wale design me hota tha:
-      #   1. daily_domains/         → raw whois data, date-wise
-      #   2. master_control_room/   → final categorized leads, date-wise
-      # Yahi ab tera permanent storage hai — GitHub pe hamesha available
-      # rahega, kahin se bhi (browser/git) access ho sakta hai.
-      # ⚠️ PRIVACY: master_control_room CSVs me scraped emails/phones hote
-      #     hain. Agar repo public hai, ise PRIVATE rakhna consider karo.
-      - name: 💾 Commit Raw + Final Data Back to Repo
+
+      # ============================================================
+      # 6. COMMIT PERMANENT DATA + QUEUE STATE
+      # ------------------------------------------------------------
+      # Permanent:
+      #   daily_domains/
+      #   master_control_room/
+      #
+      # Queue/resume:
+      #   processing_queue/
+      #   ai_queue/
+      #
+      # state/ is also included so legacy migration / compatibility
+      # state is not accidentally discarded.
+      # ============================================================
+      - name: 💾 Commit Pipeline Data + Queue State
         if: always()
         run: |
           git config user.name "bawa-leads-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add daily_domains/ master_control_room/ || true
+
+          git add \
+            daily_domains/ \
+            master_control_room/ \
+            processing_queue/ \
+            ai_queue/ \
+            state/ || true
+
           if ! git diff --cached --quiet; then
-            git commit -m "🤖 Auto-update: raw + processed leads for $(date -u +'%Y-%m-%d')"
+            git commit -m "🤖 Auto-update: pipeline data + queue state $(date -u +'%Y-%m-%d')"
             git push
           else
-            echo "Koi naya data nahi bana is run me — kuch commit karne ko nahi hai."
+            echo "Koi naya data/state change nahi hua — kuch commit karne ko nahi hai."
           fi
 
+
+      # ============================================================
+      # 7. UPLOAD FINAL CSV ARTIFACTS
+      # ============================================================
       - name: 📤 Upload Final VIP Leads as Artifact
-        if: always()   # pipeline beech me fail/timeout ho jaaye tab bhi jo bana wo save ho
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: VIP_Leads_Archive
-          path: master_control_room/*.csv
+          path: |
+            master_control_room/*.csv
           if-no-files-found: warn
+          retention-days: 90
