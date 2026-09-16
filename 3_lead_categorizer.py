@@ -46,12 +46,13 @@ import requests
 # CONFIGURATION
 # ============================================================
 
-INPUT_FILE = "Ultimate_God_Leads.csv"
+INPUT_FILE = os.environ.get("CATEGORIZER_INPUT_FILE", "Ultimate_God_Leads.csv")
 
-OUTPUT_FILE = "Bawa_Categorized_Leads.csv"
+OUTPUT_FILE = os.environ.get("CATEGORIZER_OUTPUT_FILE", "Bawa_Categorized_Leads.csv")
 
-PARTIAL_OUTPUT_FILE = (
-    "Bawa_Categorized_Leads.partial.csv"
+PARTIAL_OUTPUT_FILE = os.environ.get(
+    "CATEGORIZER_PARTIAL_FILE",
+    "Bawa_Categorized_Leads.partial.csv",
 )
 
 GROQ_API_URL = (
@@ -2043,7 +2044,7 @@ def main():
     print()
     print("=" * 72)
     print(
-        "☁️ BAWA GROQ AI LEAD CATEGORIZER v3.1 (FIXED)"
+        "☁️ BAWA AI LEAD CATEGORIZER v3.2 (WORKER MODE)"
     )
     print("=" * 72)
     print()
