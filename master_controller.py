@@ -1,38 +1,40 @@
+import csv
 import os
+import re
+import shutil
+import socket
+import subprocess
 import sys
 import time
-import subprocess
-import socket
-import shutil
-import re
 from datetime import datetime
 
 # ============================================================
-# BAWA MASTER CONTROLLER v2.3
+# BAWA MASTER CONTROLLER v3.0 - QUEUE ARCHITECTURE
 # Compatible with:
 #   1) domain_sniper.py v2.2
 #   2) 1_domain_filter.py v3.1
 #   3) 2_deep_xray_scanner.py v3.1
 #   4) 3_lead_categorizer.py v3.1
 #
-# Design:
-#   - Raw WhoisDS sync is independent from the active processing date
-#   - One active processing date at a time
-#   - Date lock controls resume
-#   - No outer retry storm for X-Ray
-#   - X-Ray owns HTTP retries + SUCCESS/DEAD cache semantics
-#   - Categorizer owns partial-output resume + Groq quota handling
-#   - Non-zero categorizer exit never deletes partial work
-#   - Final CSV is archived only after a real final output exists
-#   - All paths are repo-relative / GitHub Actions safe
-#   - Raw harvesting never gets blocked by an old date's AI quota pause
-#   - Raw harvest runs once per controller run, not once per backlog date
+# CORE CHANGE:
+#   Raw collection, website intelligence, and AI categorization
+#   are now decoupled into queues.
+#
+#   WhoisDS can keep harvesting new dates even when Groq is blocked.
+#   X-Ray runs per-date workspaces.
+#   AI consumes a GLOBAL pending queue across all completed X-Ray dates.
+#   Categorized rows are retained in one canonical partial registry.
+#   A date is archived only after every X-Ray lead for that date has
+#   a successful AI classification.
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_DATA_DIR = os.path.join(BASE_DIR, "daily_domains")
-STATE_DIR = os.path.join(BASE_DIR, "state")
+PROCESSING_QUEUE_DIR = os.path.join(BASE_DIR, "processing_queue")
+AI_QUEUE_DIR = os.path.join(BASE_DIR, "ai_queue")
+AI_ENGINE_DIR = os.path.join(AI_QUEUE_DIR, "engine")
 MASTER_DIR = os.path.join(BASE_DIR, "master_control_room")
+STATE_DIR = os.path.join(BASE_DIR, "state")
 
 SNIPER_SCRIPT = os.path.join(BASE_DIR, "domain_sniper.py")
 FILTER_1_SCRIPT = os.path.join(BASE_DIR, "1_domain_filter.py")
@@ -41,36 +43,41 @@ FILTER_3_SCRIPT = os.path.join(BASE_DIR, "3_lead_categorizer.py")
 
 PYTHON = sys.executable
 
-# GitHub Actions gives the job its own hard ceiling.
-# Keep a safety margin below the runner's maximum.
 MAX_RUNTIME_SECONDS = int(
     os.environ.get("MAX_RUNTIME_SECONDS", 5 * 3600 + 30 * 60)
 )
+SAFETY_RESERVE_SECONDS = int(os.environ.get("SAFETY_RESERVE_SECONDS", 60))
+MIN_STAGE_SECONDS = int(os.environ.get("MIN_STAGE_SECONDS", 120))
 
-# Per-stage safety timeouts.
 SNIPER_TIMEOUT = int(os.environ.get("SNIPER_TIMEOUT", 30 * 60))
 FILTER_1_TIMEOUT = int(os.environ.get("FILTER_1_TIMEOUT", 10 * 60))
 FILTER_2_TIMEOUT = int(os.environ.get("FILTER_2_TIMEOUT", 2 * 60 * 60))
 FILTER_3_TIMEOUT = int(os.environ.get("FILTER_3_TIMEOUT", 4 * 60 * 60))
 
-DATE_LOCK_FILE = "date_lock.txt"
-RAW_INPUT_FILE = "domain-names.txt"
-FILTER_1_OUTPUT = "premium_domains.txt"
-FILTER_1_REPORT = "premium_domain_report.txt"
-XRAY_DONE_FILE = "filter_2.done"
-XRAY_CACHE_FILE = "scanned_cache.txt"
-XRAY_OUTPUT_FILE = "Ultimate_God_Leads.csv"
+# Persistent state inside the queue architecture.
+ACTIVE_DATE_FILE = os.path.join(PROCESSING_QUEUE_DIR, "active_date.txt")
+AI_CANONICAL_PARTIAL = os.path.join(
+    AI_QUEUE_DIR, "Bawa_Categorized_Leads.partial.csv"
+)
+AI_ENGINE_INPUT = os.path.join(AI_ENGINE_DIR, "Ultimate_God_Leads.csv")
+AI_ENGINE_FINAL = os.path.join(AI_ENGINE_DIR, "Bawa_Categorized_Leads.csv")
+AI_ENGINE_PARTIAL = os.path.join(
+    AI_ENGINE_DIR, "Bawa_Categorized_Leads.partial.csv"
+)
+AI_QUEUE_BUILD_TMP = os.path.join(AI_QUEUE_DIR, ".pending_build.csv")
 
-CAT_OUTPUT_FILE = "Bawa_Categorized_Leads.csv"
-CAT_PARTIAL_FILE = "Bawa_Categorized_Leads.partial.csv"
+RAW_FILE_RE = re.compile(r"^(?:Whois_Leads_Extracted_|.*?)(\d{4}-\d{2}-\d{2}).*\.txt$", re.I)
 
-for directory in (RAW_DATA_DIR, STATE_DIR, MASTER_DIR):
+for directory in (
+    RAW_DATA_DIR,
+    PROCESSING_QUEUE_DIR,
+    AI_QUEUE_DIR,
+    AI_ENGINE_DIR,
+    MASTER_DIR,
+    STATE_DIR,
+):
     os.makedirs(directory, exist_ok=True)
 
-
-# ============================================================
-# LOGGING / BASIC HELPERS
-# ============================================================
 
 def log(message):
     print(
@@ -80,7 +87,6 @@ def log(message):
 
 
 def check_internet():
-    """Quick connectivity test; stage scripts still perform their own retries."""
     try:
         socket.create_connection(("1.1.1.1", 53), timeout=3)
         return True
@@ -92,891 +98,740 @@ def elapsed_seconds(run_start):
     return time.time() - run_start
 
 
-def budget_remaining(run_start, reserve_seconds=30):
-    return MAX_RUNTIME_SECONDS - elapsed_seconds(run_start) - reserve_seconds
+def remaining_budget(run_start):
+    return MAX_RUNTIME_SECONDS - elapsed_seconds(run_start) - SAFETY_RESERVE_SECONDS
 
 
-def within_budget(run_start, required_seconds=0):
-    return budget_remaining(run_start, reserve_seconds=30) > required_seconds
+def stage_timeout(run_start, configured_timeout):
+    """Return a safe dynamic timeout that never exceeds remaining controller budget."""
+    return max(0, min(configured_timeout, int(remaining_budget(run_start))))
 
 
-def require_stage_budget(run_start, stage_name, timeout_seconds):
-    """
-    Refuse to launch a stage unless its full configured timeout plus the
-    controller safety reserve still fits inside this run's remaining budget.
-    This prevents the runner from killing a long stage before the controller
-    gets a chance to preserve state and exit cleanly.
-    """
-    if run_start is None:
-        return True
-
-    remaining = budget_remaining(run_start, reserve_seconds=30)
-    if remaining <= timeout_seconds:
+def can_start_stage(run_start, stage_name, minimum_seconds=MIN_STAGE_SECONDS):
+    remaining = remaining_budget(run_start)
+    if remaining < minimum_seconds:
         log(
-            f"⏱️ Not enough budget to launch {stage_name}: "
-            f"remaining≈{max(0, int(remaining))}s, "
-            f"required={timeout_seconds}s + 30s safety reserve. "
-            "Stage not launched; state remains resumable."
+            f"⏱️ Not enough controller budget for {stage_name}: "
+            f"remaining≈{max(0, int(remaining))}s, minimum={minimum_seconds}s."
         )
         return False
-
     return True
 
 
-# ============================================================
-# FILE / DATE DISCOVERY
-# ============================================================
-
-def state_path(filename):
-    return os.path.join(STATE_DIR, filename)
-
-
-def master_path(filename):
-    return os.path.join(MASTER_DIR, filename)
-
-
-def find_raw_file(target_date_str):
-    """
-    Find WhoisDS raw TXT for one exact target date.
-    Prefer an exact date-containing filename.
-    """
-    if not os.path.isdir(RAW_DATA_DIR):
-        return None
-
-    candidates = []
-    for filename in os.listdir(RAW_DATA_DIR):
-        if not filename.lower().endswith(".txt"):
-            continue
-        if target_date_str not in filename:
-            continue
-
-        full_path = os.path.join(RAW_DATA_DIR, filename)
-        if os.path.isfile(full_path):
-            candidates.append(full_path)
-
-    if not candidates:
-        return None
-
-    # Deterministic selection if more than one candidate exists.
-    candidates.sort()
-    return candidates[0]
-
-
-def extract_date_from_filename(filename):
-    match = re.search(r"\d{4}-\d{2}-\d{2}", filename)
-    return match.group(0) if match else None
-
-
-def get_all_raw_data_dates():
-    dates_found = []
-
-    if os.path.isdir(RAW_DATA_DIR):
-        for filename in os.listdir(RAW_DATA_DIR):
-            if not filename.lower().endswith(".txt"):
-                continue
-
-            date_str = extract_date_from_filename(filename)
-            if not date_str:
-                continue
-
-            try:
-                dates_found.append(
-                    datetime.strptime(date_str, "%Y-%m-%d").date()
-                )
-            except ValueError:
-                pass
-
-    return sorted(set(dates_found))
-
-
-# ============================================================
-# WORKSPACE / LOCK STATE
-# ============================================================
-
-def read_locked_date():
-    path = state_path(DATE_LOCK_FILE)
-
-    if not os.path.exists(path):
-        return None
-
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            value = handle.read().strip()
-        return value or None
-    except OSError as exc:
-        log(f"⚠️ Could not read date lock: {exc}")
-        return None
-
-
-def write_locked_date(target_date_str):
-    tmp_path = state_path(f"{DATE_LOCK_FILE}.tmp")
-    final_path = state_path(DATE_LOCK_FILE)
-
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        handle.write(target_date_str)
-
-    os.replace(tmp_path, final_path)
-
-
-def remove_file(filename):
-    path = state_path(filename)
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-            log(f"   Removed: {filename}")
-    except OSError as exc:
-        log(f"⚠️ Could not remove {filename}: {exc}")
-
-
-def is_workspace_dirty():
-    """
-    A lock itself means there is an active/resumable date.
-    Stage artifacts also count as dirty state.
-    """
-    tracked = [
-        DATE_LOCK_FILE,
-        RAW_INPUT_FILE,
-        FILTER_1_OUTPUT,
-        FILTER_1_REPORT,
-        XRAY_DONE_FILE,
-        XRAY_CACHE_FILE,
-        XRAY_OUTPUT_FILE,
-        CAT_OUTPUT_FILE,
-        CAT_PARTIAL_FILE,
-    ]
-
-    return any(os.path.exists(state_path(name)) for name in tracked)
-
-
-def cleanup_success_workspace():
-    """
-    Remove only pipeline-owned state artifacts after final archive succeeds.
-    """
-    for filename in [
-        RAW_INPUT_FILE,
-        FILTER_1_OUTPUT,
-        FILTER_1_REPORT,
-        XRAY_DONE_FILE,
-        XRAY_CACHE_FILE,
-        XRAY_OUTPUT_FILE,
-        CAT_OUTPUT_FILE,
-        CAT_PARTIAL_FILE,
-        DATE_LOCK_FILE,
-    ]:
-        remove_file(filename)
-
-
-# ============================================================
-# STAGE STATUS
-# ============================================================
-
-def get_step_status():
-    return {
-        "raw_file": os.path.exists(state_path(RAW_INPUT_FILE)),
-        "step1_done": os.path.exists(state_path(FILTER_1_OUTPUT)),
-        "step2_done": os.path.exists(state_path(XRAY_DONE_FILE)),
-        "step3_done": os.path.exists(state_path(CAT_OUTPUT_FILE)),
-        "cat_partial": os.path.exists(state_path(CAT_PARTIAL_FILE)),
-        "has_cache": os.path.exists(state_path(XRAY_CACHE_FILE)),
-        "has_god": os.path.exists(state_path(XRAY_OUTPUT_FILE)),
-        "date_lock": read_locked_date(),
-    }
-
-
-def log_status():
-    status = get_step_status()
-    compact = (
-        f"raw={status['raw_file']} | "
-        f"filter1={status['step1_done']} | "
-        f"xray_done={status['step2_done']} | "
-        f"xray_cache={status['has_cache']} | "
-        f"xray_csv={status['has_god']} | "
-        f"cat_final={status['step3_done']} | "
-        f"cat_partial={status['cat_partial']} | "
-        f"lock={status['date_lock']}"
-    )
-    log(f"STATUS: {compact}")
-
-
-# ============================================================
-# SUBPROCESS EXECUTION
-# ============================================================
-
-def run_stage(script_path, timeout):
-    """
-    Run a stage from STATE_DIR so its relative input/output files
-    land in the controller's state workspace.
-    """
+def run_stage(script_path, cwd, timeout):
     return subprocess.run(
         [PYTHON, script_path],
         check=True,
-        cwd=STATE_DIR,
+        cwd=cwd,
         timeout=timeout,
     )
 
 
-# ============================================================
-# ARCHIVE VALIDATION
-# ============================================================
+def atomic_write_text(path, text):
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
 
-def is_valid_final_csv(path):
-    """
-    Minimal sanity check. Do not declare completion from the mere
-    existence of a zero-byte file.
-    """
-    if not os.path.isfile(path):
+
+def safe_remove(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        log(f"⚠️ Could not remove {path}: {exc}")
+
+
+def read_active_date():
+    try:
+        if os.path.exists(ACTIVE_DATE_FILE):
+            with open(ACTIVE_DATE_FILE, "r", encoding="utf-8") as handle:
+                value = handle.read().strip()
+                return value or None
+    except OSError as exc:
+        log(f"⚠️ Active date read failed: {exc}")
+    return None
+
+
+def write_active_date(date_str):
+    atomic_write_text(ACTIVE_DATE_FILE, date_str.strip() + "\n")
+
+
+def clear_active_date():
+    safe_remove(ACTIVE_DATE_FILE)
+
+
+def raw_file_for_date(date_str):
+    exact = []
+    try:
+        for filename in os.listdir(RAW_DATA_DIR):
+            if not filename.lower().endswith(".txt"):
+                continue
+            if date_str in filename:
+                exact.append(os.path.join(RAW_DATA_DIR, filename))
+    except OSError as exc:
+        log(f"⚠️ Raw-data listing failed: {exc}")
+        return None
+
+    if not exact:
+        return None
+    exact.sort()
+    return exact[0]
+
+
+def all_raw_dates():
+    dates = set()
+    try:
+        filenames = os.listdir(RAW_DATA_DIR)
+    except OSError as exc:
+        log(f"⚠️ Could not scan raw data directory: {exc}")
+        return []
+
+    for filename in filenames:
+        if not filename.lower().endswith(".txt"):
+            continue
+        match = re.search(r"\d{4}-\d{2}-\d{2}", filename)
+        if match:
+            try:
+                datetime.strptime(match.group(0), "%Y-%m-%d")
+                dates.add(match.group(0))
+            except ValueError:
+                pass
+    return sorted(dates)
+
+
+def workspace_for_date(date_str):
+    return os.path.join(PROCESSING_QUEUE_DIR, date_str)
+
+
+def source_xray_file(date_str):
+    return os.path.join(workspace_for_date(date_str), "Ultimate_God_Leads.csv")
+
+
+def source_xray_done(date_str):
+    return os.path.join(workspace_for_date(date_str), "filter_2.done")
+
+
+def final_archive_for_date(date_str):
+    return os.path.join(
+        MASTER_DIR, f"Final_Extracted_Leads_{date_str}.csv"
+    )
+
+
+def valid_csv(path):
+    if not os.path.exists(path) or os.path.getsize(path) < 20:
         return False
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            return bool(reader.fieldnames)
+    except (OSError, csv.Error):
+        return False
+
+
+def load_rows(path):
+    if not os.path.exists(path):
+        return [], []
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        return rows, list(reader.fieldnames or [])
+
+
+def migrate_legacy_state():
+    """Migrate the old single-date state/ layout into the new queue layout once.
+
+    This is deliberately conservative: files are copied into their new queue
+    location first, validated, then removed from legacy state. Existing queue
+    files always win so a repeated migration cannot overwrite newer progress.
+    """
+    legacy_lock = os.path.join(STATE_DIR, "date_lock.txt")
+    if not os.path.exists(legacy_lock):
+        return
 
     try:
-        if os.path.getsize(path) < 50:
-            return False
+        with open(legacy_lock, "r", encoding="utf-8") as handle:
+            date_str = handle.read().strip()
+    except OSError as exc:
+        log(f"⚠️ Could not read legacy date lock: {exc}")
+        return
 
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-            sample = handle.read(1000)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        log("⚠️ Legacy date lock is invalid; leaving legacy state untouched.")
+        return
 
-        if not sample.strip():
-            return False
+    log(f"🔄 LEGACY MIGRATION: importing old state for {date_str} into queue architecture...")
+    workspace = workspace_for_date(date_str)
+    os.makedirs(workspace, exist_ok=True)
 
-        # Preserve the old controller's protection against placeholder output.
-        if "NO_DATA" in sample.upper():
-            return False
+    files_to_copy = (
+        "domain-names.txt",
+        "premium_domains.txt",
+        "premium_domain_report.txt",
+        "Ultimate_God_Leads.csv",
+        "scanned_cache.txt",
+        "filter_2.done",
+    )
 
-        # New categorizer's expected first column.
-        if "Domain" not in sample:
-            return False
+    for name in files_to_copy:
+        src = os.path.join(STATE_DIR, name)
+        dst = os.path.join(workspace, name)
+        if not os.path.exists(src):
+            continue
+        if not os.path.exists(dst):
+            try:
+                shutil.copy2(src, dst)
+                log(f"   ✅ Migrated {name}")
+            except OSError as exc:
+                log(f"   ⚠️ Could not migrate {name}: {exc}")
 
-        return True
+    # Migrate the legacy AI progress into the canonical registry, adding
+    # source-date metadata that did not exist in the old architecture.
+    legacy_partial = os.path.join(STATE_DIR, "Bawa_Categorized_Leads.partial.csv")
+    legacy_final = os.path.join(STATE_DIR, "Bawa_Categorized_Leads.csv")
+    legacy_sources = [path for path in (legacy_partial, legacy_final) if valid_csv(path)]
+
+    if legacy_sources:
+        merged_by_domain = {}
+        merged_fields = []
+        for src in legacy_sources:
+            try:
+                rows, fields = load_rows(src)
+            except Exception as exc:
+                log(f"   ⚠️ Could not read legacy AI output {os.path.basename(src)}: {exc}")
+                continue
+
+            for field in fields:
+                if field not in merged_fields:
+                    merged_fields.append(field)
+            for row in rows:
+                domain = normalize_domain(row.get("Domain", ""))
+                if not domain:
+                    continue
+                row["Domain"] = domain
+                row["_Source_Date"] = date_str
+                merged_by_domain[domain] = row
+
+        if merged_by_domain:
+            if "_Source_Date" not in merged_fields:
+                merged_fields.append("_Source_Date")
+            temp = AI_CANONICAL_PARTIAL + ".tmp"
+            os.makedirs(AI_QUEUE_DIR, exist_ok=True)
+            with open(temp, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=merged_fields, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(merged_by_domain.values())
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, AI_CANONICAL_PARTIAL)
+            log(
+                f"   ✅ Migrated legacy AI progress: "
+                f"{len(merged_by_domain):,} classified leads."
+            )
+
+    # If the old final categorizer output existed, it is now represented in
+    # the canonical registry and should not remain in the legacy engine path.
+    for legacy_path in (
+        legacy_partial,
+        legacy_final,
+        os.path.join(STATE_DIR, "date_lock.txt"),
+    ):
+        safe_remove(legacy_path)
+
+    log(f"✅ Legacy migration complete for {date_str}.")
+
+
+def normalize_domain(value):
+    value = (value or "").strip().lower()
+    value = re.sub(r"^https?://", "", value)
+    value = value.split("/", 1)[0]
+    return value.rstrip(".")
+
+
+def load_canonical_domains():
+    domains = set()
+    if not os.path.exists(AI_CANONICAL_PARTIAL):
+        return domains
+    try:
+        with open(
+            AI_CANONICAL_PARTIAL,
+            "r",
+            encoding="utf-8-sig",
+            newline="",
+        ) as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                domain = normalize_domain(row.get("Domain", ""))
+                if domain:
+                    domains.add(domain)
+    except Exception as exc:
+        log(f"⚠️ Canonical AI registry read failed: {exc}")
+    return domains
+
+
+def prepare_xray_workspace(date_str):
+    workspace = workspace_for_date(date_str)
+    os.makedirs(workspace, exist_ok=True)
+
+    raw_source = raw_file_for_date(date_str)
+    raw_target = os.path.join(workspace, "domain-names.txt")
+
+    if not raw_source:
+        return False, "MISSING"
+
+    if not os.path.exists(raw_target):
+        shutil.copy2(raw_source, raw_target)
+        log(f"📥 Raw input copied into queue workspace for {date_str}.")
+    else:
+        log(f"ℹ️ Existing queue workspace preserved for {date_str}.")
+
+    return True, "READY"
+
+
+def run_filter_and_xray(date_str, run_start):
+    workspace = workspace_for_date(date_str)
+    os.makedirs(workspace, exist_ok=True)
+
+    write_active_date(date_str)
+
+    filter_output = os.path.join(workspace, "premium_domains.txt")
+    xray_done = os.path.join(workspace, "filter_2.done")
+    xray_csv = os.path.join(workspace, "Ultimate_God_Leads.csv")
+
+    # LEVEL 1
+    if not os.path.exists(filter_output):
+        if not can_start_stage(run_start, f"Filter 1 ({date_str})"):
+            return "PAUSED"
+        timeout = stage_timeout(run_start, FILTER_1_TIMEOUT)
+        log(f"STEP X1: Running Domain Filter for {date_str} (timeout={timeout}s)...")
+        try:
+            run_stage(FILTER_1_SCRIPT, workspace, timeout)
+        except subprocess.TimeoutExpired:
+            log("⏱️ Filter 1 timed out. Workspace preserved for next run.")
+            return "PAUSED"
+        except subprocess.CalledProcessError as exc:
+            log(f"❌ Filter 1 failed with exit code {exc.returncode}.")
+            return "ERROR"
+        except OSError as exc:
+            log(f"❌ Could not launch Filter 1: {exc}")
+            return "ERROR"
+    else:
+        log(f"STEP X1: {date_str} already filtered — skipping.")
+
+    # LEVEL 2
+    if not os.path.exists(xray_done):
+        if not can_start_stage(run_start, f"X-Ray ({date_str})"):
+            return "PAUSED"
+        timeout = stage_timeout(run_start, FILTER_2_TIMEOUT)
+        log(f"STEP X2: Running X-Ray for {date_str} (timeout={timeout}s)...")
+        try:
+            run_stage(FILTER_2_SCRIPT, workspace, timeout)
+        except subprocess.TimeoutExpired:
+            log("⏱️ X-Ray timed out. Its cache/workspace remains resumable.")
+            return "PAUSED"
+        except subprocess.CalledProcessError as exc:
+            log(f"❌ X-Ray failed with exit code {exc.returncode}.")
+            return "ERROR"
+        except OSError as exc:
+            log(f"❌ Could not launch X-Ray: {exc}")
+            return "ERROR"
+    else:
+        log(f"STEP X2: {date_str} already X-Rayed — skipping.")
+
+    if not os.path.exists(xray_done):
+        log("⚠️ X-Ray did not produce filter_2.done. Date remains resumable.")
+        return "PAUSED"
+
+    if not valid_csv(xray_csv):
+        log("⚠️ X-Ray completion flag exists but CSV is missing/invalid.")
+        return "ERROR"
+
+    log(
+        f"✅ X-Ray queue source ready: {date_str} "
+        f"({os.path.getsize(xray_csv):,} bytes)"
+    )
+    return "SUCCESS"
+
+
+def available_xray_dates():
+    dates = []
+    for date_str in all_raw_dates():
+        if os.path.exists(source_xray_done(date_str)) and valid_csv(
+            source_xray_file(date_str)
+        ):
+            dates.append(date_str)
+    return dates
+
+
+def build_pending_ai_queue():
+    """Build one global AI input from every completed X-Ray date."""
+    canonical_domains = load_canonical_domains()
+    all_rows = []
+    output_fields = []
+    seen_pending = set()
+
+    for date_str in available_xray_dates():
+        xray_path = source_xray_file(date_str)
+        try:
+            rows, fields = load_rows(xray_path)
+        except Exception as exc:
+            log(f"⚠️ Could not read X-Ray queue {date_str}: {exc}")
+            continue
+
+        if not rows:
+            continue
+
+        for field in fields:
+            if field not in output_fields:
+                output_fields.append(field)
+
+        for row in rows:
+            domain = normalize_domain(row.get("Domain", ""))
+            if not domain:
+                continue
+            if domain in canonical_domains or domain in seen_pending:
+                continue
+
+            row["Domain"] = domain
+            row["_Source_Date"] = date_str
+            if "_Source_Date" not in output_fields:
+                output_fields.append("_Source_Date")
+
+            seen_pending.add(domain)
+            all_rows.append(row)
+
+    if not output_fields:
+        output_fields = ["Domain", "_Source_Date"]
+
+    with open(
+        AI_QUEUE_BUILD_TMP,
+        "w",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=output_fields,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(all_rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    os.replace(AI_QUEUE_BUILD_TMP, AI_ENGINE_INPUT)
+
+    return len(all_rows), len(canonical_domains), output_fields
+
+
+def merge_ai_results_into_canonical():
+    """Promote engine final/partial output into the persistent canonical registry."""
+    source_path = None
+    if valid_csv(AI_ENGINE_PARTIAL):
+        source_path = AI_ENGINE_PARTIAL
+    elif valid_csv(AI_ENGINE_FINAL):
+        source_path = AI_ENGINE_FINAL
+
+    if not source_path:
+        return 0
+
+    rows, fields = load_rows(source_path)
+    if not rows:
+        return 0
+
+    # Prefer the engine file as the canonical registry directly after atomic replace.
+    temp = AI_CANONICAL_PARTIAL + ".tmp"
+    with open(temp, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fields,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, AI_CANONICAL_PARTIAL)
+
+    if source_path != AI_CANONICAL_PARTIAL:
+        safe_remove(source_path)
+
+    # The categorizer final means "all rows currently supplied" were processed.
+    # Rename nothing here: canonical partial remains the long-lived resume registry.
+    return len(rows)
+
+
+def clear_engine_work_files():
+    safe_remove(AI_ENGINE_FINAL)
+    # Keep AI_ENGINE_PARTIAL only if it was not promoted; normally it is promoted above.
+    safe_remove(AI_ENGINE_PARTIAL)
+
+
+def run_ai_queue(run_start):
+    pending_count, completed_count, _ = build_pending_ai_queue()
+    log(
+        f"🤖 GLOBAL AI QUEUE: pending={pending_count:,} | "
+        f"canonical_completed={completed_count:,}"
+    )
+
+    if pending_count == 0:
+        return "NO_PENDING"
+
+    if not can_start_stage(run_start, "AI Categorizer"):
+        return "PAUSED"
+
+    # Make the engine's partial registry start from the canonical registry.
+    # This preserves all historical successful classifications between runs.
+    if os.path.exists(AI_CANONICAL_PARTIAL):
+        if not os.path.exists(AI_ENGINE_PARTIAL) or os.path.getsize(AI_ENGINE_PARTIAL) == 0:
+            shutil.copy2(AI_CANONICAL_PARTIAL, AI_ENGINE_PARTIAL)
+
+    timeout = stage_timeout(run_start, FILTER_3_TIMEOUT)
+    log(f"STEP AI: Running Groq categorizer against global queue (timeout={timeout}s)...")
+
+    try:
+        run_stage(FILTER_3_SCRIPT, AI_ENGINE_DIR, timeout)
+    except subprocess.TimeoutExpired:
+        log("⏱️ AI Categorizer timed out. Partial progress will be promoted.")
+    except subprocess.CalledProcessError as exc:
+        log(
+            f"⚠️ AI Categorizer exited {exc.returncode}; "
+            "promoting any partial progress and pausing this run."
+        )
+    except OSError as exc:
+        log(f"❌ Could not launch AI Categorizer: {exc}")
+        return "ERROR"
+
+    merged = merge_ai_results_into_canonical()
+    log(f"✅ Canonical AI registry now contains {merged:,} rows.")
+
+    # If the engine produced a complete final file, it was promoted above and removed.
+    # Rebuild the queue once to know whether anything remains.
+    remaining, _, _ = build_pending_ai_queue()
+    if remaining == 0:
+        log("🎉 Global AI queue fully classified.")
+        return "SUCCESS"
+
+    log(f"⏸️ Global AI queue still has {remaining:,} unresolved leads.")
+    return "PAUSED"
+
+
+def write_user_facing_archive(rows, fields, date_str):
+    archive_fields = [field for field in fields if field != "_Source_Date"]
+    target = final_archive_for_date(date_str)
+    temp = target + ".tmp"
+
+    with open(temp, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=archive_fields,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, target)
+
+
+def archive_completed_dates():
+    if not os.path.exists(AI_CANONICAL_PARTIAL):
+        return 0
+
+    canonical_rows, fields = load_rows(AI_CANONICAL_PARTIAL)
+    by_date = {}
+    for row in canonical_rows:
+        date_str = (row.get("_Source_Date") or "").strip()
+        domain = normalize_domain(row.get("Domain", ""))
+        if date_str and domain:
+            by_date.setdefault(date_str, []).append(row)
+
+    archived = 0
+    for date_str in available_xray_dates():
+        archive_path = final_archive_for_date(date_str)
+        if valid_csv(archive_path):
+            continue
+
+        source_rows, _ = load_rows(source_xray_file(date_str))
+        source_domains = {
+            normalize_domain(row.get("Domain", ""))
+            for row in source_rows
+            if normalize_domain(row.get("Domain", ""))
+        }
+
+        classified_rows = by_date.get(date_str, [])
+        classified_domains = {
+            normalize_domain(row.get("Domain", ""))
+            for row in classified_rows
+            if normalize_domain(row.get("Domain", ""))
+        }
+
+        if source_domains and not source_domains.issubset(classified_domains):
+            continue
+
+        # Zero-lead X-Ray file is considered complete too.
+        write_user_facing_archive(
+            classified_rows,
+            fields,
+            date_str,
+        )
+        archived += 1
+        log(
+            f"🎉 DATE CLOSED: {date_str} → "
+            f"{os.path.basename(archive_path)}"
+        )
+
+    return archived
+
+
+def cleanup_closed_workspace(date_str):
+    """Keep the X-Ray source CSV for audit/queue purposes, remove only transient work files."""
+    workspace = workspace_for_date(date_str)
+    if not os.path.isdir(workspace):
+        return
+
+    for name in (
+        "domain-names.txt",
+        "premium_domains.txt",
+        "premium_domain_report.txt",
+        "scanned_cache.txt",
+        "filter_2.done",
+    ):
+        path = os.path.join(workspace, name)
+        if os.path.exists(path):
+            safe_remove(path)
+
+    try:
+        remaining = os.listdir(workspace)
     except OSError:
-        return False
+        return
+
+    # Keep Ultimate_God_Leads.csv as the durable queue/audit source.
+    if remaining == ["Ultimate_God_Leads.csv"]:
+        return
 
 
-def is_valid_archive(path):
-    return is_valid_final_csv(path)
+def pick_next_xray_date():
+    for date_str in all_raw_dates():
+        if valid_csv(final_archive_for_date(date_str)):
+            continue
+        if os.path.exists(source_xray_done(date_str)) and valid_csv(
+            source_xray_file(date_str)
+        ):
+            continue
+        return date_str
+    return None
 
 
-# ============================================================
-# RAW DATA HARVEST — INDEPENDENT FROM DATE PROCESSING
-# ============================================================
+def process_one_xray_date(run_start):
+    active = read_active_date()
+    if active:
+        date_str = active
+        log(f"🛑 RESUME X-RAY DATE: {date_str}")
+    else:
+        date_str = pick_next_xray_date()
+        if not date_str:
+            return "NO_DATE"
+        log(f"🎯 NEXT X-RAY DATE: {date_str}")
+
+    ok, state = prepare_xray_workspace(date_str)
+    if not ok:
+        log(f"ℹ️ Raw data for {date_str} is currently missing upstream.")
+        clear_active_date()
+        return "MISSING"
+
+    result = run_filter_and_xray(date_str, run_start)
+    if result == "SUCCESS":
+        clear_active_date()
+        log(f"✅ X-Ray date complete: {date_str}")
+        return "SUCCESS"
+
+    return result
+
 
 def run_raw_sync(run_start):
-    """
-    Refresh daily_domains/ independently of the currently active processing date.
-
-    The v2.2 controller only launched Sniper as part of fire_the_pipeline().
-    That meant a paused old date (for example, a Groq quota wall on 2026-07-30)
-    could prevent newer WhoisDS raw dates from ever being harvested.
-
-    v2.3 fixes that by running the Sniper in its standalone full-history mode
-    at the beginning of every controller run. The sniper itself skips healthy
-    files and downloads only missing dates.
-
-    This is best-effort: a Sniper failure must NOT block processing of raw data
-    that is already present in daily_domains/.
-    """
-    log("RAW SYNC: Refreshing WhoisDS history independently of active pipeline date...")
-
-    if not require_stage_budget(run_start, "WhoisDS Raw Sync", SNIPER_TIMEOUT):
-        log("⏭️ Raw sync skipped because the remaining controller budget is too small.")
+    if not can_start_stage(run_start, "WhoisDS raw sync"):
         return "PAUSED"
 
-    if not check_internet():
-        log("⚠️ Internet unavailable before Raw Sync. Existing raw data will still be processed.")
-        return "PAUSED"
-
+    timeout = stage_timeout(run_start, SNIPER_TIMEOUT)
+    log("RAW SYNC: Refreshing WhoisDS history independently of all processing queues...")
     try:
-        # No target date => domain_sniper.py v2.2 enters full-history mode.
-        subprocess.run(
-            [PYTHON, SNIPER_SCRIPT],
-            check=True,
-            cwd=BASE_DIR,
-            timeout=SNIPER_TIMEOUT,
-        )
+        run_stage(SNIPER_SCRIPT, BASE_DIR, timeout)
         log("✅ Raw WhoisDS sync finished.")
         return "SUCCESS"
     except subprocess.TimeoutExpired:
-        log("⏱️ Raw WhoisDS sync timed out. Any successfully finalized dates remain saved.")
+        log("⏱️ Raw sync timed out; processing queues remain untouched.")
         return "PAUSED"
     except subprocess.CalledProcessError as exc:
-        log(
-            f"⚠️ Raw WhoisDS sync exited with code {exc.returncode}. "
-            "Continuing with whatever raw data is already available."
-        )
+        log(f"❌ Raw sync failed with exit code {exc.returncode}.")
         return "ERROR"
     except OSError as exc:
-        log(f"⚠️ Could not launch Raw WhoisDS sync: {exc}. Continuing with existing data.")
+        log(f"❌ Could not launch raw sync: {exc}")
         return "ERROR"
 
-
-# ============================================================
-# STEP 1 — RAW INPUT PREPARATION
-# ============================================================
-
-def prepare_raw_input_for_date(target_date_str, is_resume=False):
-    """
-    Prepare state/domain-names.txt from the already-harvested daily_domains file.
-
-    Sniper is intentionally NOT launched here. Raw harvesting is handled once
-    per controller run by run_raw_sync(), independent of the processing lock.
-    """
-    target_raw = find_raw_file(target_date_str)
-    target_input = state_path(RAW_INPUT_FILE)
-
-    if os.path.exists(target_input):
-        log(
-            "STEP 1: Existing domain-names.txt found — "
-            "using existing state instead of replacing it."
-        )
-        return "SUCCESS"
-
-    if target_raw and os.path.isfile(target_raw):
-        try:
-            shutil.copy2(target_raw, target_input)
-            if is_resume:
-                log(
-                    f"STEP 1: Resume recovered raw input from {target_raw}."
-                )
-            else:
-                log(
-                    f"STEP 1: Raw input piped from harvested file: {target_raw}"
-                )
-            return "SUCCESS"
-        except OSError as exc:
-            log(f"❌ Could not copy raw data into state: {exc}")
-            return "ERROR"
-
-    log(
-        f"ℹ️ Raw WhoisDS file for {target_date_str} is not present in daily_domains/."
-    )
-    return "MISSING"
-
-
-# ============================================================
-# STEP 2 — DOMAIN FILTER
-# ============================================================
-
-def run_domain_filter():
-    log("STEP 2: Running Level 1 Domain Filter...")
-
-    if not os.path.exists(state_path(RAW_INPUT_FILE)):
-        log("❌ domain-names.txt missing before Filter 1.")
-        return "ERROR"
-
-    try:
-        run_stage(FILTER_1_SCRIPT, FILTER_1_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        log("❌ Filter 1 timed out. Keeping workspace for next run.")
-        return "PAUSED"
-    except subprocess.CalledProcessError as exc:
-        log(f"❌ Filter 1 exited with code {exc.returncode}. Keeping state.")
-        return "ERROR"
-    except OSError as exc:
-        log(f"❌ Could not launch Filter 1: {exc}")
-        return "ERROR"
-
-    output = state_path(FILTER_1_OUTPUT)
-
-    if not os.path.exists(output):
-        log("❌ Filter 1 finished but premium_domains.txt is missing.")
-        return "ERROR"
-
-    log("✅ Level 1 Domain Filter complete.")
-    return "SUCCESS"
-
-
-# ============================================================
-# STEP 3 — X-RAY
-# ============================================================
-
-def run_xray():
-    """
-    v3.1 X-Ray owns:
-      - per-thread HTTP sessions
-      - HTTP retry logic
-      - SUCCESS / DEAD cache entries
-      - terminal handling of expected network/request failures
-      - filter_2.done creation only when no retry work remains
-
-    Therefore the master controller deliberately does NOT wrap this
-    stage in its own 5-attempt loop. That old outer loop was the retry storm.
-    """
-    done_file = state_path(XRAY_DONE_FILE)
-
-    if os.path.exists(done_file):
-        log("STEP 3: X-Ray already marked done — skipping.")
-        return "SUCCESS"
-
-    log("STEP 3: Running X-Ray Scanner (Level 2)...")
-
-    if not os.path.exists(state_path(FILTER_1_OUTPUT)):
-        log("❌ premium_domains.txt missing before X-Ray.")
-        return "ERROR"
-
-    if not check_internet():
-        log(
-            "⚠️ Internet is currently unavailable. "
-            "Let the next scheduled run resume X-Ray."
-        )
-        return "PAUSED"
-
-    try:
-        run_stage(FILTER_2_SCRIPT, FILTER_2_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        log(
-            "⏱️ X-Ray timed out. "
-            "Its cache/output remain intact; next run will resume."
-        )
-        return "PAUSED"
-    except subprocess.CalledProcessError as exc:
-        log(
-            f"❌ X-Ray exited with code {exc.returncode}. "
-            "Keeping cache/output for next run."
-        )
-        return "ERROR"
-    except OSError as exc:
-        log(f"❌ Could not launch X-Ray: {exc}")
-        return "ERROR"
-
-    if os.path.exists(done_file):
-        log("✅ X-Ray completed — filter_2.done present.")
-        return "SUCCESS"
-
-    log(
-        "⚠️ X-Ray returned without filter_2.done. "
-        "This means work is not terminally complete yet; preserving state."
-    )
-    return "PAUSED"
-
-
-# ============================================================
-# STEP 4 — GROQ CATEGORIZER
-# ============================================================
-
-def run_categorizer():
-    """
-    v3.1 categorizer owns:
-      - final CSV
-      - .partial.csv resume state
-      - strict JSON validation
-      - rate limiting / Retry-After handling
-      - quota hard-wall detection
-
-    Controller rule:
-      - never delete .partial on timeout/failure
-      - never fabricate final completion
-      - non-zero exit means stop this run and let the next scheduled run resume
-    """
-    final_file = state_path(CAT_OUTPUT_FILE)
-    partial_file = state_path(CAT_PARTIAL_FILE)
-
-    if os.path.exists(final_file):
-        log("STEP 4: Categorizer final output already exists — skipping.")
-        return "SUCCESS"
-
-    log("STEP 4: Running AI Categorizer (Groq)...")
-
-    if not os.path.exists(state_path(XRAY_DONE_FILE)):
-        log("❌ X-Ray is not marked done before Categorizer.")
-        return "ERROR"
-
-    if not os.path.exists(state_path(XRAY_OUTPUT_FILE)):
-        log("❌ Ultimate_God_Leads.csv missing before Categorizer.")
-        return "ERROR"
-
-    try:
-        run_stage(FILTER_3_SCRIPT, FILTER_3_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        if os.path.exists(partial_file):
-            log(
-                "⏱️ Categorizer timed out. "
-                ".partial.csv preserved for next run."
-            )
-        else:
-            log(
-                "⏱️ Categorizer timed out before partial output appeared. "
-                "State preserved for next run."
-            )
-        return "PAUSED"
-    except subprocess.CalledProcessError as exc:
-        if os.path.exists(partial_file):
-            log(
-                f"⚠️ Categorizer exited {exc.returncode}; "
-                ".partial.csv preserved for next run."
-            )
-        else:
-            log(
-                f"⚠️ Categorizer exited {exc.returncode}; "
-                "no partial file found. Will retry on next run."
-            )
-        return "PAUSED"
-    except OSError as exc:
-        log(f"❌ Could not launch Categorizer: {exc}")
-        return "ERROR"
-
-    if os.path.exists(final_file):
-        log("✅ Categorizer produced final output.")
-        return "SUCCESS"
-
-    if os.path.exists(partial_file):
-        log(
-            "ℹ️ Categorizer left partial progress intentionally. "
-            "No final file yet; next run will resume."
-        )
-        return "PAUSED"
-
-    log(
-        "⚠️ Categorizer returned without final or partial output. "
-        "Preserving lock and stopping this run."
-    )
-    return "PAUSED"
-
-
-# ============================================================
-# FINAL ARCHIVE
-# ============================================================
-
-def archive_final_output(target_date_str):
-    final_temp = state_path(CAT_OUTPUT_FILE)
-    archived_out = master_path(
-        f"Final_Extracted_Leads_{target_date_str}.csv"
-    )
-
-    if not is_valid_final_csv(final_temp):
-        log("❌ Final categorized output is missing or invalid.")
-        return "ERROR"
-
-    try:
-        # Replace only after the new final output has passed sanity checks.
-        os.replace(final_temp, archived_out)
-    except OSError as exc:
-        log(f"❌ Could not archive final CSV: {exc}")
-        return "ERROR"
-
-    if not is_valid_archive(archived_out):
-        log("❌ Archived CSV failed post-move validation.")
-        return "ERROR"
-
-    log(f"🎉 DONE! VIP List archived: {archived_out}")
-    cleanup_success_workspace()
-    log(f"Workspace clean. {target_date_str} closed ✅")
-    return "SUCCESS"
-
-
-# ============================================================
-# PIPELINE FOR ONE DATE
-# ============================================================
-
-def fire_the_pipeline(target_date_str, is_resume=False, run_start=None):
-    log("")
-    log("============================================================")
-    log(f"[!!!] STARTING PIPELINE FOR DATE: {target_date_str} [!!!]")
-    log(f"Resume mode: {is_resume}")
-    log("============================================================")
-
-    # Always refresh the lock at the beginning of an active date.
-    write_locked_date(target_date_str)
-
-    if run_start is not None and not within_budget(run_start):
-        log("⏱️ Not enough run budget left to start another stage.")
-        return "PAUSED"
-
-    # ---------------- STEP 1: RAW INPUT ----------------
-    # Raw harvesting is now independent. At this point we only copy the
-    # already-downloaded target date into the active state workspace.
-    raw_status = prepare_raw_input_for_date(
-        target_date_str,
-        is_resume=is_resume,
-    )
-
-    if raw_status == "MISSING":
-        # Upstream data is simply not available yet. This is normal for a
-        # brand-new date and should not leave a stale processing lock behind.
-        log(
-            f"ℹ️ WhoisDS raw data for {target_date_str} is not available yet."
-        )
-        remove_file(DATE_LOCK_FILE)
-        return "MISSING"
-
-    if raw_status != "SUCCESS":
-        return raw_status
-
-    # ---------------- STEP 2: FILTER 1 ----------------
-    if not os.path.exists(state_path(FILTER_1_OUTPUT)):
-        if not require_stage_budget(run_start, "Filter 1", FILTER_1_TIMEOUT):
-            return "PAUSED"
-        status = run_domain_filter()
-        if status != "SUCCESS":
-            return status
-    else:
-        log("STEP 2: Already done — skipping.")
-
-    # ---------------- STEP 3: X-RAY ----------------
-    if not os.path.exists(state_path(XRAY_DONE_FILE)):
-        if not require_stage_budget(run_start, "X-Ray", FILTER_2_TIMEOUT):
-            return "PAUSED"
-        status = run_xray()
-        if status != "SUCCESS":
-            return status
-    else:
-        log("STEP 3: Already done — skipping.")
-
-    # ---------------- STEP 4: CATEGORIZER ----------------
-    if not os.path.exists(state_path(CAT_OUTPUT_FILE)):
-        if not require_stage_budget(run_start, "AI Categorizer", FILTER_3_TIMEOUT):
-            return "PAUSED"
-        status = run_categorizer()
-        if status != "SUCCESS":
-            return status
-    else:
-        log("STEP 4: Already done — skipping.")
-
-    # ---------------- STEP 5: ARCHIVE ----------------
-    return archive_final_output(target_date_str)
-
-
-# ============================================================
-# BACKLOG HELPERS
-# ============================================================
-
-def final_archive_path(target_date_str):
-    return master_path(f"Final_Extracted_Leads_{target_date_str}.csv")
-
-
-def needs_backlog_processing(target_date_str):
-    """
-    True if there is raw data but no trustworthy final archive.
-    """
-    archive = final_archive_path(target_date_str)
-
-    if not os.path.exists(archive):
-        return True
-
-    return not is_valid_archive(archive)
-
-
-def clean_invalid_archive(target_date_str):
-    archive = final_archive_path(target_date_str)
-
-    if os.path.exists(archive) and not is_valid_archive(archive):
-        try:
-            os.remove(archive)
-            log(f"🧹 Removed invalid existing archive: {archive}")
-        except OSError as exc:
-            log(f"⚠️ Could not remove invalid archive: {exc}")
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     log("============================================================")
-    log("BAWA MASTER CONTROLLER v2.3 ONLINE")
-    log("Single-run / bounded-budget / resume-safe mode")
+    log("BAWA MASTER CONTROLLER v3.0 ONLINE")
+    log("Queue-based / decoupled ingestion / resumable AI")
     log("============================================================")
 
     run_start = time.time()
-    raw_sync_attempted = False
 
-    while True:
-        if not within_budget(run_start):
-            log(
-                "⏱️ Time budget khatam — exiting cleanly. "
-                "Next scheduled run will continue the lock/state."
-            )
-            break
+    # One-time migration so the first queue-based run does not discard the
+    # currently active legacy 2026-07-30 state/progress.
+    migrate_legacy_state()
 
-        if not check_internet():
-            log(
-                "⚠️ Internet unavailable right now — "
-                "exiting this run without destroying state."
-            )
-            break
+    if not check_internet():
+        log("⚠️ Internet unavailable — exiting without touching queue state.")
+        return
 
-        # ----------------------------------------------------
-        # RAW HARVEST (independent from processing state)
-        # ----------------------------------------------------
-        # IMPORTANT: Do this once per controller run, before resume/backlog
-        # processing, so a paused old date cannot freeze acquisition of newer
-        # WhoisDS dates. Do NOT repeat it after a successful backlog date in
-        # the same run; the raw sync has already refreshed daily_domains/.
-        if not raw_sync_attempted:
-            raw_sync_attempted = True
-            raw_sync_result = run_raw_sync(run_start)
-            if raw_sync_result != "SUCCESS":
-                log(
-                    f"ℹ️ Raw sync returned {raw_sync_result}; "
-                    "continuing with all raw data already present locally."
-                )
-        else:
-            log("RAW SYNC: Already attempted this controller run — skipping duplicate sync.")
+    # --------------------------------------------------------
+    # PHASE 1: ALWAYS HARVEST RAW DATA
+    # --------------------------------------------------------
+    raw_result = run_raw_sync(run_start)
+    if raw_result not in {"SUCCESS", "PAUSED"}:
+        log(f"⚠️ Raw sync returned {raw_result}; continuing with already-known data.")
 
-        # ----------------------------------------------------
-        # SCENARIO 1: ACTIVE / DIRTY WORKSPACE
-        # ----------------------------------------------------
-        if is_workspace_dirty():
-            locked_date = read_locked_date()
-
-            if locked_date:
-                log(f"🛑 RESUME: Active date lock found for {locked_date}")
-                log_status()
-
-                result = fire_the_pipeline(
-                    locked_date,
-                    is_resume=True,
-                    run_start=run_start,
-                )
-
-                if result == "SUCCESS":
-                    log(f"✅ Resumed date {locked_date} successfully.")
-                    continue
-
-                if result == "MISSING":
-                    log(
-                        f"ℹ️ Locked date {locked_date} is still missing upstream data."
-                    )
-                    remove_file(DATE_LOCK_FILE)
-                    break
-
-                # IMPORTANT:
-                # Do not immediately call the same date again in this run.
-                # This prevents quota/retry/error spin loops.
-                log(
-                    f"⏸️ Resume for {locked_date} returned {result}. "
-                    "Keeping state for the next scheduled run."
-                )
-                break
-
-            # Dirty state with no lock is not safely attributable to a date.
-            # Remove only pipeline artifacts, then start cleanly.
-            log(
-                "⚠️ Dirty workspace but no date lock. "
-                "Treating it as orphaned pipeline state."
-            )
-
-            for filename in [
-                RAW_INPUT_FILE,
-                FILTER_1_OUTPUT,
-                FILTER_1_REPORT,
-                XRAY_DONE_FILE,
-                XRAY_CACHE_FILE,
-                XRAY_OUTPUT_FILE,
-                CAT_OUTPUT_FILE,
-                CAT_PARTIAL_FILE,
-            ]:
-                remove_file(filename)
-
-            continue
-
-        # ----------------------------------------------------
-        # SCENARIO 2: HISTORICAL BACKLOG
-        # ----------------------------------------------------
-        log("Scanning all raw data dates...")
-        raw_dates = get_all_raw_data_dates()
-
-        backlog_processed = False
-        backlog_budget_blocked = False
-        backlog_stop_run = False
-
-        for raw_date in raw_dates:
-            if not within_budget(run_start):
-                log("⏱️ Not enough budget left for another backlog date.")
-                backlog_budget_blocked = True
-                break
-
-            date_str = raw_date.strftime("%Y-%m-%d")
-
-            if not needs_backlog_processing(date_str):
-                continue
-
-            clean_invalid_archive(date_str)
-
-            log(f"🎯 Processing backlog date: {date_str}")
-
-            result = fire_the_pipeline(
-                date_str,
-                is_resume=False,
-                run_start=run_start,
-            )
-
-            backlog_processed = True
-
-            if result == "SUCCESS":
-                log(f"✅ Backlog date {date_str} complete.")
-                # Only a successful date allows another pipeline attempt
-                # in this same controller run.
-                break
-
-            if result == "MISSING":
-                log(
-                    f"ℹ️ Backlog date {date_str} is missing upstream raw data."
-                )
-                # MISSING means upstream data is not available yet. Clear the
-                # active lock immediately so the next scheduled run starts
-                # fresh instead of unnecessarily entering resume mode.
-                remove_file(DATE_LOCK_FILE)
-                backlog_stop_run = True
-                break
-
-            # IMPORTANT: PAUSED/ERROR must terminate this controller run.
-            # Do not `continue` the outer while-loop here, because fire_the_pipeline
-            # has already written the active date lock and the next iteration
-            # would immediately re-enter Scenario 1 and launch the same date again.
-            log(
-                f"⏸️ Backlog date {date_str} returned {result}. "
-                "State remains resumable for the next scheduled run. Exiting this run."
-            )
-            backlog_stop_run = True
-            break
-
-        if backlog_budget_blocked or backlog_stop_run:
-            break
-
-        if backlog_processed:
-            # SUCCESS is the only result that reaches here. Re-scan state so
-            # the next backlog date can be picked without an immediate retry
-            # of the same failed/paused date.
-            continue
-
-        # ----------------------------------------------------
-        # SCENARIO 3: TODAY
-        # ----------------------------------------------------
-        today_str = datetime.now().date().strftime("%Y-%m-%d")
-        today_archive = final_archive_path(today_str)
-
-        if is_valid_archive(today_archive):
-            log(
-                f"✅ Today's archive already exists and is valid: "
-                f"{today_archive}"
-            )
-            break
-
-        log(f"Fetching today's data: {today_str}...")
-
-        today_result = fire_the_pipeline(
-            today_str,
-            is_resume=False,
-            run_start=run_start,
+    # --------------------------------------------------------
+    # PHASE 2: ADVANCE ONE X-RAY DATE WHEN BUDGET ALLOWS
+    # --------------------------------------------------------
+    xray_result = process_one_xray_date(run_start)
+    if xray_result in {"PAUSED", "ERROR"}:
+        log(
+            f"⏸️ X-Ray stage returned {xray_result}. "
+            "No same-run retry of the same date."
         )
+    elif xray_result == "SUCCESS":
+        log("✅ One X-Ray date successfully added to the global AI queue.")
 
-        if today_result == "SUCCESS":
-            log(f"✅ Today's pipeline completed: {today_str}")
-        elif today_result == "MISSING":
-            log(
-                f"ℹ️ Aaj ({today_str}) ka WhoisDS data abhi available nahi hai."
-            )
-            # MISSING is not a failure state. Remove lock so next cron
-            # can attempt a fresh start.
-            remove_file(DATE_LOCK_FILE)
+    # --------------------------------------------------------
+    # PHASE 3: GLOBAL AI QUEUE
+    # --------------------------------------------------------
+    if remaining_budget(run_start) >= MIN_STAGE_SECONDS:
+        ai_result = run_ai_queue(run_start)
+        if ai_result == "PAUSED":
+            log("⏸️ AI quota/budget prevented full queue completion; state preserved.")
+        elif ai_result == "SUCCESS":
+            log("✅ AI queue caught up completely.")
+        elif ai_result == "NO_PENDING":
+            log("ℹ️ No unresolved AI leads currently waiting.")
         else:
-            log(
-                f"⏸️ Today's pipeline returned {today_result}. "
-                "Keeping state for the next scheduled run."
-            )
+            log(f"⚠️ AI queue returned {ai_result}.")
+    else:
+        log("⏱️ Not enough budget left to start AI queue safely.")
 
-        # One today's attempt per scheduled run.
-        break
+    # --------------------------------------------------------
+    # PHASE 4: CLOSE ANY DATES THAT ARE NOW FULLY CLASSIFIED
+    # --------------------------------------------------------
+    archive_completed_dates()
 
-    log("Master Controller run complete. Exiting.")
+    log("============================================================")
+    log("Master Controller v3.0 run complete. Exiting.")
+    log("============================================================")
 
 
 if __name__ == "__main__":
