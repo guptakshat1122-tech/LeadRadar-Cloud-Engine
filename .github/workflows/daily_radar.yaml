@@ -2,7 +2,7 @@ name: 🚀 Bawa Cloud Engine Auto-Pilot
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # 02:00 UTC daily
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 340
 
     steps:
+
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
@@ -34,21 +35,20 @@ jobs:
             processing_queue
             ai_queue
             state
-          key: pipeline-state-${{ github.run_id }}
+          key: pipeline-state-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            pipeline-state-${{ github.ref_name }}-
             pipeline-state-
 
       - name: 🔥 Fire The Master Controller
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          MAX_RUNTIME_SECONDS: '19800'       # 5h30m controller budget
+          MAX_RUNTIME_SECONDS: '19800'
           SAFETY_RESERVE_SECONDS: '60'
           GROQ_CLAIM_SIZE: '50'
         run: |
           python master_controller.py
 
-      # The controller and/or an Ollama laptop worker may push while the job
-      # is running. Re-sync before committing durable repo state.
       - name: 💾 Commit Durable Pipeline + Queue State
         if: always()
         shell: bash
@@ -58,38 +58,53 @@ jobs:
           git config user.name "bawa-leads-bot"
           git config user.email "actions@users.noreply.github.com"
 
-          for attempt in 1 2 3 4 5; do
-            echo "🔄 Git sync attempt $attempt/5"
+          echo "🔄 Refreshing repository before durable commit..."
 
-            git fetch origin
-            git pull --rebase origin "${GITHUB_REF_NAME}"
+          git fetch origin
+          git pull --rebase origin "${GITHUB_REF_NAME}"
 
-            git add \
-              daily_domains/ \
-              processing_queue/ \
-              ai_queue/ \
-              master_control_room/ \
-              state/ || true
+          echo "📦 Staging durable pipeline state..."
 
-            if git diff --cached --quiet; then
-              echo "Koi durable data/state change nahi hua."
-              exit 0
+          for path in \
+            daily_domains \
+            processing_queue \
+            ai_queue \
+            master_control_room \
+            state
+          do
+            if [ -e "$path" ]; then
+              echo "   ✅ Adding: $path"
+              git add -f "$path"
+            else
+              echo "   ℹ️ Missing: $path — skipping"
             fi
+          done
 
-            git commit -m "🤖 Auto-update: pipeline data + queue state $(date -u +'%Y-%m-%d')"
+          if git diff --cached --quiet; then
+            echo "ℹ️ No durable state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "🤖 Auto-update pipeline state $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          for attempt in 1 2 3 4 5; do
+
+            echo "🚀 Push attempt $attempt/5"
 
             if git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "✅ Push successful."
+              echo "✅ Durable state pushed successfully."
               exit 0
             fi
 
-            echo "⚠️ Push conflict/rejection; retrying after refresh..."
-            git reset --soft HEAD~1
-            git reset
+            echo "⚠️ Push conflict — refreshing..."
+
+            git fetch origin
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+
             sleep 2
           done
 
-          echo "❌ Could not push durable pipeline state after retries."
+          echo "❌ Durable state push failed after 5 attempts."
           exit 1
 
       - name: 📤 Upload Final VIP Leads as Artifact
