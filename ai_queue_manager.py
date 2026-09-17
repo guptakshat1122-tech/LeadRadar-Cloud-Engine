@@ -195,6 +195,8 @@ def candidate_rows(limit=None):
 def claim_batch(worker, batch_size):
     for attempt in range(4):
         git_sync_before_claim()
+        # Safety: git pull/rebase ke baad bhi claim directory guaranteed rahe
+        os.makedirs(CLAIMS_DIR, exist_ok=True)
         candidates = candidate_rows(limit=batch_size)
         if not candidates:
             return None
