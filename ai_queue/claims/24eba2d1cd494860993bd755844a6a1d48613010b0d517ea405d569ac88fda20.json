@@ -1,0 +1,11 @@
+{
+  "claim_id": "91cfdfbb6bfd",
+  "worker": "groq",
+  "domain": "309software.com",
+  "domains": [
+    "309software.com"
+  ],
+  "created_at": 1789713810,
+  "created_at_iso": "2026-09-18T06:43:30+00:00",
+  "expires_at": 1789757010
+}
