@@ -23,31 +23,90 @@ from ai_queue_manager import (
     publish_result_and_release,
 )
 
+
 # ============================================================
-# BAWA MASTER CONTROLLER v4.1
-# X-Ray completion recovery + Global AI Queue + Groq Worker
+# BAWA MASTER CONTROLLER v4.2
+# ============================================================
+#
+# MAJOR FIX IN v4.2:
+#
+#   X-Ray completion is now DURABLY CHECKPOINTED TO GIT
+#   BEFORE the controller enters the AI queue.
+#
+# Old failure pattern:
+#
+#   X-Ray 100%
+#       ↓
+#   AI claim_batch()
+#       ↓
+#   Git error / quota / crash
+#       ↓
+#   X-Ray files remain only on runner
+#       ↓
+#   next GitHub run sees old state
+#       ↓
+#   X-Ray starts again
+#
+# New pattern:
+#
+#   X-Ray 100%
+#       ↓
+#   persist_xray_state()
+#       ↓
+#   Git commit + push
+#       ↓
+#   AI claim_batch()
+#
+# Therefore an AI-stage failure cannot destroy an already
+# completed X-Ray stage.
+#
+# Also:
+#   - Active-date state is durable.
+#   - Filter-1 state is durable.
+#   - Partial X-Ray state is checkpointed on timeout/error.
+#   - X-Ray completion can be recovered from scanned_cache.txt
+#     when every premium domain is represented there.
+#   - Groq worker remains global/shared with Ollama.
 #
 # Compatible with:
 #   domain_sniper.py v2.2
 #   1_domain_filter.py v3.1
 #   2_deep_xray_scanner.py v3.1
-#   3_lead_categorizer.py v3.2
-#
-# Main fix:
-#   A missing filter_2.done no longer automatically means
-#   "run X-Ray again".
-#
-#   If scanned_cache.txt proves that every premium domain
-#   was already classified as SUCCESS or DEAD, the controller
-#   automatically recreates filter_2.done and skips X-Ray.
+#   3_lead_categorizer.py v3.2 worker-compatible
+#   ai_queue_manager.py updated Git-safe version
 # ============================================================
 
-SNIPER_SCRIPT = os.path.join(BASE_DIR, "domain_sniper.py")
-FILTER_1_SCRIPT = os.path.join(BASE_DIR, "1_domain_filter.py")
-FILTER_2_SCRIPT = os.path.join(BASE_DIR, "2_deep_xray_scanner.py")
-FILTER_3_SCRIPT = os.path.join(BASE_DIR, "3_lead_categorizer.py")
+
+# ============================================================
+# SCRIPT PATHS
+# ============================================================
+
+SNIPER_SCRIPT = os.path.join(
+    BASE_DIR,
+    "domain_sniper.py",
+)
+
+FILTER_1_SCRIPT = os.path.join(
+    BASE_DIR,
+    "1_domain_filter.py",
+)
+
+FILTER_2_SCRIPT = os.path.join(
+    BASE_DIR,
+    "2_deep_xray_scanner.py",
+)
+
+FILTER_3_SCRIPT = os.path.join(
+    BASE_DIR,
+    "3_lead_categorizer.py",
+)
 
 PYTHON = sys.executable
+
+
+# ============================================================
+# RUNTIME CONFIG
+# ============================================================
 
 MAX_RUNTIME_SECONDS = int(
     os.environ.get(
@@ -105,10 +164,26 @@ GROQ_CLAIM_SIZE = int(
     )
 )
 
+
+# ============================================================
+# DURABLE WORKSPACE
+# ============================================================
+
 ACTIVE_DATE_FILE = os.path.join(
     PROCESSING_QUEUE_DIR,
     "active_date.txt",
 )
+
+DAILY_DOMAINS_DIR = os.path.join(
+    BASE_DIR,
+    "daily_domains",
+)
+
+MASTER_CONTROL_ROOM_DIR = os.path.join(
+    BASE_DIR,
+    "master_control_room",
+)
+
 
 for directory in (
     PROCESSING_QUEUE_DIR,
@@ -133,7 +208,7 @@ def log(message):
 
 
 # ============================================================
-# NETWORK
+# INTERNET
 # ============================================================
 
 def check_internet():
@@ -142,6 +217,7 @@ def check_internet():
             ("1.1.1.1", 53),
             timeout=3,
         )
+
         return True
 
     except OSError:
@@ -149,7 +225,7 @@ def check_internet():
 
 
 # ============================================================
-# TIME BUDGET
+# BUDGET
 # ============================================================
 
 def remaining_budget(run_start):
@@ -175,6 +251,7 @@ def can_start_stage(
             f"remaining≈{max(0, int(remaining))}s, "
             f"required={required_seconds}s."
         )
+
         return False
 
     return True
@@ -184,21 +261,23 @@ def stage_timeout(
     run_start,
     configured,
 ):
+    remaining = int(
+        remaining_budget(
+            run_start
+        )
+    )
+
     return max(
         1,
         min(
             configured,
-            int(
-                remaining_budget(
-                    run_start
-                )
-            ),
+            remaining,
         ),
     )
 
 
 # ============================================================
-# PROCESS RUNNER
+# PROCESS EXECUTION
 # ============================================================
 
 def run_script(
@@ -208,10 +287,7 @@ def run_script(
     env=None,
 ):
     return subprocess.run(
-        [
-            PYTHON,
-            script_path,
-        ],
+        [PYTHON, script_path],
         cwd=cwd,
         timeout=timeout,
         check=True,
@@ -233,6 +309,7 @@ def read_active_date():
                 "r",
                 encoding="utf-8",
             ) as handle:
+
                 value = handle.read().strip()
 
                 return value or None
@@ -246,7 +323,15 @@ def read_active_date():
 
 
 def write_active_date(date_str):
-    temp = ACTIVE_DATE_FILE + ".tmp"
+    os.makedirs(
+        PROCESSING_QUEUE_DIR,
+        exist_ok=True,
+    )
+
+    temp = (
+        ACTIVE_DATE_FILE
+        + ".tmp"
+    )
 
     with open(
         temp,
@@ -285,34 +370,32 @@ def clear_active_date():
 
 
 # ============================================================
-# RAW DATA
+# RAW DATE DISCOVERY
 # ============================================================
 
-def raw_file_for_date(date_str):
-
-    raw_dir = os.path.join(
-        BASE_DIR,
-        "daily_domains",
-    )
-
+def raw_file_for_date(
+    date_str,
+):
     if not os.path.isdir(
-        raw_dir
+        DAILY_DOMAINS_DIR
     ):
         return None
 
     matches = []
 
     for filename in os.listdir(
-        raw_dir
+        DAILY_DOMAINS_DIR
     ):
 
         if (
-            filename.lower().endswith(".txt")
+            filename.lower().endswith(
+                ".txt"
+            )
             and date_str in filename
         ):
             matches.append(
                 os.path.join(
-                    raw_dir,
+                    DAILY_DOMAINS_DIR,
                     filename,
                 )
             )
@@ -325,21 +408,15 @@ def raw_file_for_date(date_str):
 
 
 def all_raw_dates():
-
     dates = set()
 
-    raw_dir = os.path.join(
-        BASE_DIR,
-        "daily_domains",
-    )
-
     if not os.path.isdir(
-        raw_dir
+        DAILY_DOMAINS_DIR
     ):
         return []
 
     for filename in os.listdir(
-        raw_dir
+        DAILY_DOMAINS_DIR
     ):
 
         if not filename.lower().endswith(
@@ -355,63 +432,112 @@ def all_raw_dates():
         if not match:
             continue
 
+        date_str = match.group(0)
+
         try:
             datetime.strptime(
-                match.group(0),
+                date_str,
                 "%Y-%m-%d",
             )
 
             dates.add(
-                match.group(0)
+                date_str
             )
 
         except ValueError:
             pass
 
-    return sorted(dates)
+    return sorted(
+        dates
+    )
 
 
 # ============================================================
-# DATE WORKSPACE
+# DATE WORKSPACE PATHS
 # ============================================================
 
-def workspace_for_date(date_str):
+def workspace_for_date(
+    date_str,
+):
     return os.path.join(
         PROCESSING_QUEUE_DIR,
         date_str,
     )
 
 
-def xray_file(date_str):
+def premium_file(
+    date_str,
+):
     return os.path.join(
-        workspace_for_date(date_str),
-        "Ultimate_God_Leads.csv",
-    )
-
-
-def xray_done(date_str):
-    return os.path.join(
-        workspace_for_date(date_str),
-        "filter_2.done",
-    )
-
-
-def xray_cache_file(date_str):
-    return os.path.join(
-        workspace_for_date(date_str),
-        "scanned_cache.txt",
-    )
-
-
-def premium_file(date_str):
-    return os.path.join(
-        workspace_for_date(date_str),
+        workspace_for_date(
+            date_str
+        ),
         "premium_domains.txt",
     )
 
 
-def prepare_xray_workspace(date_str):
+def premium_report_file(
+    date_str,
+):
+    return os.path.join(
+        workspace_for_date(
+            date_str
+        ),
+        "premium_domain_report.txt",
+    )
 
+
+def domain_input_file(
+    date_str,
+):
+    return os.path.join(
+        workspace_for_date(
+            date_str
+        ),
+        "domain-names.txt",
+    )
+
+
+def xray_file(
+    date_str,
+):
+    return os.path.join(
+        workspace_for_date(
+            date_str
+        ),
+        "Ultimate_God_Leads.csv",
+    )
+
+
+def xray_done(
+    date_str,
+):
+    return os.path.join(
+        workspace_for_date(
+            date_str
+        ),
+        "filter_2.done",
+    )
+
+
+def xray_cache_file(
+    date_str,
+):
+    return os.path.join(
+        workspace_for_date(
+            date_str
+        ),
+        "scanned_cache.txt",
+    )
+
+
+# ============================================================
+# WORKSPACE PREPARATION
+# ============================================================
+
+def prepare_xray_workspace(
+    date_str,
+):
     workspace = workspace_for_date(
         date_str
     )
@@ -425,9 +551,8 @@ def prepare_xray_workspace(date_str):
         date_str
     )
 
-    raw_target = os.path.join(
-        workspace,
-        "domain-names.txt",
+    raw_target = domain_input_file(
+        date_str
     )
 
     if not raw_source:
@@ -436,7 +561,6 @@ def prepare_xray_workspace(date_str):
     if not os.path.exists(
         raw_target
     ):
-
         shutil.copy2(
             raw_source,
             raw_target,
@@ -451,16 +575,284 @@ def prepare_xray_workspace(date_str):
 
 
 # ============================================================
-# X-RAY COMPLETION RECOVERY
+# GIT HELPERS FOR X-RAY CHECKPOINT
 # ============================================================
 
-def load_premium_domains(date_str):
+def git_command(
+    *args,
+    check=True,
+    capture=True,
+):
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=BASE_DIR,
+        text=True,
+        capture_output=capture,
+        check=False,
+    )
 
+    if (
+        check
+        and proc.returncode != 0
+    ):
+
+        stderr = (
+            proc.stderr.strip()
+            if proc.stderr
+            else ""
+        )
+
+        stdout = (
+            proc.stdout.strip()
+            if proc.stdout
+            else ""
+        )
+
+        raise RuntimeError(
+            f"git {' '.join(args)} "
+            f"failed with {proc.returncode}: "
+            f"{stderr or stdout}"
+        )
+
+    return proc
+
+
+def ensure_controller_git_identity():
+    current_name = git_command(
+        "config",
+        "--get",
+        "user.name",
+        check=False,
+    )
+
+    current_email = git_command(
+        "config",
+        "--get",
+        "user.email",
+        check=False,
+    )
+
+    if not (
+        current_name.returncode == 0
+        and (current_name.stdout or "").strip()
+    ):
+        git_command(
+            "config",
+            "user.name",
+            os.environ.get(
+                "GIT_USER_NAME",
+                "Bawa Cloud Engine",
+            ),
+        )
+
+    if not (
+        current_email.returncode == 0
+        and (current_email.stdout or "").strip()
+    ):
+        git_command(
+            "config",
+            "user.email",
+            os.environ.get(
+                "GIT_USER_EMAIL",
+                "bawa-cloud-engine@users.noreply.github.com",
+            ),
+        )
+
+
+def git_branch():
+    branch = os.environ.get(
+        "GITHUB_REF_NAME",
+        "",
+    ).strip()
+
+    if branch:
+        return branch
+
+    proc = git_command(
+        "symbolic-ref",
+        "--short",
+        "HEAD",
+        check=False,
+    )
+
+    if proc.returncode == 0:
+        value = (
+            proc.stdout or ""
+        ).strip()
+
+        if value:
+            return value
+
+    return "main"
+
+
+def git_has_staged_changes():
+    proc = git_command(
+        "diff",
+        "--cached",
+        "--quiet",
+        check=False,
+    )
+
+    return proc.returncode != 0
+
+
+def persist_xray_state(
+    reason,
+):
+    """
+    CRITICAL DURABILITY CHECKPOINT.
+
+    Only controller-owned paths are committed here:
+
+        daily_domains/
+        processing_queue/
+
+    ai_queue/ is intentionally excluded because claims/results
+    are coordinated by ai_queue_manager.py.
+    """
+
+    ensure_controller_git_identity()
+
+    branch = git_branch()
+
+    try:
+        # ----------------------------------------------------
+        # FIRST REFRESH REMOTE KNOWLEDGE
+        # ----------------------------------------------------
+        git_command(
+            "fetch",
+            "origin",
+            branch,
+        )
+
+        # ----------------------------------------------------
+        # STAGE ONLY CONTROLLER-OWNED STATE
+        # ----------------------------------------------------
+        git_command(
+            "add",
+            "-A",
+            "--",
+            "daily_domains",
+            "processing_queue",
+        )
+
+        if not git_has_staged_changes():
+            log(
+                f"💾 Checkpoint not needed — "
+                f"no Git changes ({reason})."
+            )
+
+            return True
+
+        # ----------------------------------------------------
+        # COMMIT LOCAL X-RAY STATE
+        # ----------------------------------------------------
+        message = (
+            f"💾 X-Ray checkpoint: "
+            f"{reason}"
+        )
+
+        git_command(
+            "commit",
+            "-m",
+            message,
+        )
+
+        # ----------------------------------------------------
+        # PUSH WITH REBASE RETRIES
+        # ----------------------------------------------------
+        last_error = None
+
+        for attempt in range(
+            1,
+            5,
+        ):
+
+            try:
+                git_command(
+                    "push",
+                    "origin",
+                    f"HEAD:{branch}",
+                )
+
+                log(
+                    f"✅ Durable X-Ray checkpoint pushed "
+                    f"successfully ({reason})."
+                )
+
+                return True
+
+            except Exception as exc:
+                last_error = exc
+
+                log(
+                    f"⚠️ Checkpoint push attempt "
+                    f"{attempt}/4 failed: {exc}"
+                )
+
+                if attempt >= 4:
+                    break
+
+                # Remote may have received AI queue commits.
+                # Rebase our controller-only state on top.
+                try:
+                    git_command(
+                        "fetch",
+                        "origin",
+                        branch,
+                    )
+
+                    git_command(
+                        "rebase",
+                        f"origin/{branch}",
+                    )
+
+                except Exception as rebase_exc:
+                    git_command(
+                        "rebase",
+                        "--abort",
+                        check=False,
+                    )
+
+                    log(
+                        f"⚠️ Checkpoint rebase failed: "
+                        f"{rebase_exc}"
+                    )
+
+                time.sleep(
+                    1.5 * attempt
+                )
+
+        raise RuntimeError(
+            str(last_error)
+            if last_error
+            else "X-Ray checkpoint push failed."
+        )
+
+    except Exception as exc:
+        log(
+            f"❌ DURABLE X-RAY CHECKPOINT FAILED: "
+            f"{exc}"
+        )
+
+        return False
+
+
+# ============================================================
+# PREMIUM DOMAIN LOADING
+# ============================================================
+
+def load_premium_domains(
+    date_str,
+):
     path = premium_file(
         date_str
     )
 
-    if not os.path.exists(path):
+    if not os.path.exists(
+        path
+    ):
         return set()
 
     domains = set()
@@ -469,13 +861,13 @@ def load_premium_domains(date_str):
         with open(
             path,
             "r",
-            encoding="utf-8-sig",
+            encoding="utf-8",
         ) as handle:
 
             for line in handle:
 
                 domain = normalize_domain(
-                    line.strip()
+                    line
                 )
 
                 if domain:
@@ -483,25 +875,37 @@ def load_premium_domains(date_str):
                         domain
                     )
 
-    except OSError as exc:
-
-        log(
-            f"⚠️ Could not read premium "
-            f"domain list for {date_str}: {exc}"
-        )
-
+    except OSError:
         return set()
 
     return domains
 
 
-def load_scanned_cache_domains(date_str):
+# ============================================================
+# X-RAY CACHE LOADING
+# ============================================================
+
+def load_scanned_cache_domains(
+    date_str,
+):
+    """
+    Supports:
+
+        SUCCESS|domain.com
+        DEAD|domain.com
+
+    and old format:
+
+        domain.com
+    """
 
     path = xray_cache_file(
         date_str
     )
 
-    if not os.path.exists(path):
+    if not os.path.exists(
+        path
+    ):
         return set()
 
     scanned = set()
@@ -510,239 +914,225 @@ def load_scanned_cache_domains(date_str):
         with open(
             path,
             "r",
-            encoding="utf-8-sig",
+            encoding="utf-8",
         ) as handle:
 
             for raw_line in handle:
 
-                line = raw_line.strip()
+                line = (
+                    raw_line.strip()
+                )
 
                 if not line:
                     continue
 
-                # Current format:
-                # SUCCESS|domain.com
-                # DEAD|domain.com
-                #
-                # Backward-compatible:
-                # domain.com
-
                 if "|" in line:
-
-                    _, value = line.split(
-                        "|",
-                        1,
+                    prefix, value = (
+                        line.split(
+                            "|",
+                            1,
+                        )
                     )
 
-                    domain = normalize_domain(
-                        value
-                    )
+                    if prefix.upper() in {
+                        "SUCCESS",
+                        "DEAD",
+                    }:
+                        line = value.strip()
 
-                else:
-
-                    domain = normalize_domain(
-                        line
-                    )
+                domain = normalize_domain(
+                    line
+                )
 
                 if domain:
                     scanned.add(
                         domain
                     )
 
-    except OSError as exc:
-
-        log(
-            f"⚠️ Could not read X-Ray cache "
-            f"for {date_str}: {exc}"
-        )
-
+    except OSError:
         return set()
 
     return scanned
 
 
-def xray_completion_proven(date_str):
+# ============================================================
+# X-RAY COMPLETION RECOVERY
+# ============================================================
 
-    done = xray_done(
-        date_str
-    )
+def xray_completion_proven(
+    date_str,
+):
+    """
+    If every premium domain is represented in scanned_cache.txt,
+    the X-Ray stage is logically complete even if filter_2.done
+    was not committed during an older failed run.
 
-    xray = xray_file(
-        date_str
-    )
+    This is safe because the cache records BOTH:
+        SUCCESS
+        DEAD
 
-    # Normal expected state.
-    if (
-        os.path.exists(done)
-        and os.path.exists(xray)
-    ):
-        return True
+    so absence from Ultimate_God_Leads.csv does not mean an
+    unprocessed domain.
+    """
 
     premium = load_premium_domains(
         date_str
     )
 
+    if not premium:
+        return False
+
     scanned = load_scanned_cache_domains(
         date_str
     )
 
-    # Without premium list and cache,
-    # we cannot safely prove completion.
-    if not premium:
-        return False
-
     if not scanned:
         return False
 
-    # The scanner is considered complete only when
-    # every domain that entered X-Ray is represented
-    # in the terminal cache as SUCCESS or DEAD.
     missing = premium - scanned
 
-    if missing:
-        return False
+    log(
+        f"🩺 X-Ray recovery check: "
+        f"premium={len(premium):,}, "
+        f"scanned={len(scanned):,}, "
+        f"missing={len(missing):,}"
+    )
 
-    # We have proof that every premium domain was terminally
-    # processed. Restore the completion marker if needed.
-    if not os.path.exists(done):
-
-        try:
-
-            temp = done + ".tmp"
-
-            with open(
-                temp,
-                "w",
-                encoding="utf-8",
-            ) as handle:
-
-                handle.write(
-                    "RECOVERED\n"
-                )
-
-                handle.flush()
-                os.fsync(
-                    handle.fileno()
-                )
-
-            os.replace(
-                temp,
-                done,
-            )
-
-            log(
-                f"🛡️ X-Ray completion recovered "
-                f"from scanned_cache.txt for {date_str} "
-                f"({len(scanned):,}/{len(premium):,} domains)."
-            )
-
-        except OSError as exc:
-
-            log(
-                f"⚠️ Could not recreate X-Ray "
-                f"completion marker for {date_str}: {exc}"
-            )
-
-            return False
-
-    return os.path.exists(done)
+    return not missing
 
 
-def xray_state_is_complete(date_str):
-
+def recover_xray_done_marker(
+    date_str,
+):
     done = xray_done(
         date_str
     )
 
-    xray = xray_file(
+    if os.path.exists(
+        done
+    ):
+        return False
+
+    if not os.path.exists(
+        xray_file(date_str)
+    ):
+        return False
+
+    if not xray_completion_proven(
         date_str
+    ):
+        return False
+
+    temp = (
+        done
+        + ".tmp"
     )
 
-    # Strongest evidence.
-    if (
-        os.path.exists(done)
-        and os.path.exists(xray)
-    ):
+    try:
+        with open(
+            temp,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+
+            handle.write(
+                "RECOVERED_FROM_COMPLETE_SCANNED_CACHE\n"
+            )
+
+            handle.flush()
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.replace(
+            temp,
+            done,
+        )
+
+        log(
+            f"♻️ X-Ray completion marker RECOVERED "
+            f"for {date_str} from scanned_cache.txt."
+        )
+
         return True
 
-    # Recovery path.
-    return xray_completion_proven(
-        date_str
-    )
+    except OSError as exc:
+        log(
+            f"⚠️ Could not recover X-Ray marker: "
+            f"{exc}"
+        )
+
+        return False
 
 
 # ============================================================
-# X-RAY DATE PROCESSING
+# ONE X-RAY DATE
 # ============================================================
 
-def run_one_xray_date(run_start):
-
+def run_one_xray_date(
+    run_start,
+):
     active = read_active_date()
 
     if active:
-
         date_str = active
 
         log(
-            f"🛑 RESUME X-RAY DATE: {date_str}"
+            f"🛑 RESUME X-RAY DATE: "
+            f"{date_str}"
         )
 
-        # IMPORTANT:
-        # A stale active_date.txt must never force a
-        # second full X-Ray if the previous run actually
-        # completed the scan.
-        if xray_state_is_complete(
-            date_str
-        ):
-
-            clear_active_date()
-
-            log(
-                f"✅ Existing X-Ray completion confirmed "
-                f"for {date_str} — full rescan avoided."
-            )
-
-            return "SUCCESS"
-
     else:
-
         date_str = None
 
         for candidate in all_raw_dates():
 
-            # Skip fully completed X-Ray dates.
-            if xray_state_is_complete(
-                candidate
+            if (
+                os.path.exists(
+                    xray_done(candidate)
+                )
+                and os.path.exists(
+                    xray_file(candidate)
+                )
             ):
-
                 continue
 
-            archive = os.path.join(
-                BASE_DIR,
-                "master_control_room",
+            final_archive = os.path.join(
+                MASTER_CONTROL_ROOM_DIR,
                 f"Final_Extracted_Leads_{candidate}.csv",
             )
 
             if os.path.exists(
-                archive
+                final_archive
             ):
                 continue
 
             date_str = candidate
-
             break
 
         if not date_str:
             return "NO_DATE"
 
         log(
-            f"🎯 NEXT X-RAY DATE: {date_str}"
+            f"🎯 NEXT X-RAY DATE: "
+            f"{date_str}"
         )
 
+    # --------------------------------------------------------
+    # LOCK DATE
+    # --------------------------------------------------------
     write_active_date(
         date_str
     )
 
+    # Make the active-date lock itself durable.
+    persist_xray_state(
+        f"active date locked {date_str}"
+    )
+
+    # --------------------------------------------------------
+    # PREPARE WORKSPACE
+    # --------------------------------------------------------
     if not prepare_xray_workspace(
         date_str
     ):
@@ -753,6 +1143,10 @@ def run_one_xray_date(run_start):
         )
 
         clear_active_date()
+
+        persist_xray_state(
+            f"clear missing raw date {date_str}"
+        )
 
         return "MISSING"
 
@@ -768,15 +1162,12 @@ def run_one_xray_date(run_start):
         date_str
     )
 
-    xray = xray_file(
-        date_str
-    )
-
-    # ========================================================
+    # --------------------------------------------------------
     # FILTER 1
-    # ========================================================
-
-    if not os.path.exists(filt):
+    # --------------------------------------------------------
+    if not os.path.exists(
+        filt
+    ):
 
         if not can_start_stage(
             run_start,
@@ -796,7 +1187,22 @@ def run_one_xray_date(run_start):
                 ),
             )
 
+            # CRITICAL:
+            # Persist premium domains before X-Ray starts.
+            persist_xray_state(
+                f"Filter 1 complete {date_str}"
+            )
+
         except subprocess.TimeoutExpired:
+
+            log(
+                f"⏱️ Filter 1 timed out for "
+                f"{date_str}."
+            )
+
+            persist_xray_state(
+                f"Filter 1 timeout {date_str}"
+            )
 
             return "PAUSED"
 
@@ -805,6 +1211,10 @@ def run_one_xray_date(run_start):
             log(
                 f"❌ Filter 1 failed for "
                 f"{date_str}: exit={exc.returncode}"
+            )
+
+            persist_xray_state(
+                f"Filter 1 failed {date_str}"
             )
 
             return "ERROR"
@@ -816,31 +1226,31 @@ def run_one_xray_date(run_start):
             f"already filtered — skipping."
         )
 
-    # ========================================================
-    # RE-CHECK AFTER FILTER 1
-    # ========================================================
-
-    # This is the critical protection against repeating
-    # a completed X-Ray when only filter_2.done was missing.
-
-    if xray_state_is_complete(
-        date_str
+    # --------------------------------------------------------
+    # TRY COMPLETION RECOVERY BEFORE RUNNING SCANNER
+    # --------------------------------------------------------
+    if not os.path.exists(
+        done
     ):
 
-        clear_active_date()
-
-        log(
-            f"✅ X-Ray already complete for "
-            f"{date_str} — skipping full rescan."
+        recovered = (
+            recover_xray_done_marker(
+                date_str
+            )
         )
 
-        return "SUCCESS"
+        if recovered:
 
-    # ========================================================
+            persist_xray_state(
+                f"recover X-Ray completion {date_str}"
+            )
+
+    # --------------------------------------------------------
     # X-RAY
-    # ========================================================
-
-    if not os.path.exists(done):
+    # --------------------------------------------------------
+    if not os.path.exists(
+        done
+    ):
 
         if not can_start_stage(
             run_start,
@@ -863,8 +1273,13 @@ def run_one_xray_date(run_start):
         except subprocess.TimeoutExpired:
 
             log(
-                f"⏱️ X-Ray timed out for {date_str}; "
-                f"state remains resumable."
+                f"⏱️ X-Ray timed out for "
+                f"{date_str}."
+            )
+
+            # SAVE WHATEVER THE SCANNER PRODUCED.
+            persist_xray_state(
+                f"X-Ray timeout {date_str}"
             )
 
             return "PAUSED"
@@ -876,6 +1291,11 @@ def run_one_xray_date(run_start):
                 f"{date_str}: exit={exc.returncode}"
             )
 
+            # SAVE PARTIAL CACHE / OUTPUT.
+            persist_xray_state(
+                f"X-Ray error {date_str}"
+            )
+
             return "ERROR"
 
     else:
@@ -885,52 +1305,105 @@ def run_one_xray_date(run_start):
             f"already X-Rayed — skipping."
         )
 
-    # ========================================================
-    # FINAL X-RAY COMPLETION CHECK
-    # ========================================================
-
-    # Normal scanner completion.
-    if (
-        os.path.exists(done)
-        and os.path.exists(xray)
+    # --------------------------------------------------------
+    # FINAL X-RAY VALIDATION
+    # --------------------------------------------------------
+    if not os.path.exists(
+        done
     ):
 
-        clear_active_date()
+        # Scanner may have finished but marker may be missing.
+        if (
+            os.path.exists(
+                xray_file(date_str)
+            )
+            and xray_completion_proven(
+                date_str
+            )
+        ):
 
-        log(
-            f"✅ X-Ray date complete: {date_str}"
+            recover_xray_done_marker(
+                date_str
+            )
+
+    if not (
+        os.path.exists(
+            done
         )
-
-        return "SUCCESS"
-
-    # Recovery check after scanner execution.
-    if xray_state_is_complete(
-        date_str
+        and os.path.exists(
+            xray_file(date_str)
+        )
     ):
 
-        clear_active_date()
-
-        log(
-            f"✅ X-Ray date complete and "
-            f"completion marker recovered: {date_str}"
+        # Even if incomplete, checkpoint whatever is present.
+        persist_xray_state(
+            f"X-Ray incomplete {date_str}"
         )
 
-        return "SUCCESS"
+        return "PAUSED"
 
+    # --------------------------------------------------------
+    # CRITICAL DURABILITY CHECKPOINT
+    # --------------------------------------------------------
     log(
-        f"⚠️ X-Ray output is not proven complete "
-        f"for {date_str}; keeping date resumable."
+        f"💾 X-Ray 100% complete for "
+        f"{date_str}. Persisting BEFORE AI..."
     )
 
-    return "PAUSED"
+    checkpoint_ok = persist_xray_state(
+        f"X-Ray COMPLETE {date_str}"
+    )
+
+    if not checkpoint_ok:
+
+        log(
+            "🛑 X-Ray data could NOT be pushed "
+            "to GitHub safely."
+        )
+
+        log(
+            "🛑 AI queue will NOT start for this run."
+        )
+
+        return "CHECKPOINT_FAILED"
+
+    # --------------------------------------------------------
+    # ONLY AFTER SUCCESSFUL PUSH:
+    # CLEAR ACTIVE DATE
+    # --------------------------------------------------------
+    clear_active_date()
+
+    checkpoint_ok = persist_xray_state(
+        f"clear active date after X-Ray {date_str}"
+    )
+
+    if not checkpoint_ok:
+
+        log(
+            "⚠️ Active-date clear could not be pushed, "
+            "but X-Ray data is already durable."
+        )
+
+    log(
+        f"✅ X-Ray date complete: "
+        f"{date_str}"
+    )
+
+    log(
+        "✅ X-Ray date is ready for "
+        "the global AI queue."
+    )
+
+    return "SUCCESS"
 
 
 # ============================================================
-# RAW WHOIS SYNC
+# RAW WHOISDS SYNC
 # ============================================================
 
-def run_raw_sync(run_start):
-
+def run_raw_sync(
+    run_start,
+):
     if not can_start_stage(
         run_start,
         "WhoisDS raw sync",
@@ -954,6 +1427,11 @@ def run_raw_sync(run_start):
             ),
         )
 
+        # Raw downloads are also durable immediately.
+        persist_xray_state(
+            "WhoisDS raw sync"
+        )
+
         log(
             "✅ Raw WhoisDS sync finished."
         )
@@ -967,6 +1445,10 @@ def run_raw_sync(run_start):
             "existing raw data remains intact."
         )
 
+        persist_xray_state(
+            "WhoisDS timeout"
+        )
+
         return "PAUSED"
 
     except subprocess.CalledProcessError as exc:
@@ -974,6 +1456,10 @@ def run_raw_sync(run_start):
         log(
             f"❌ Raw sync failed: "
             f"exit={exc.returncode}"
+        )
+
+        persist_xray_state(
+            "WhoisDS error"
         )
 
         return "ERROR"
@@ -984,10 +1470,13 @@ def run_raw_sync(run_start):
 # ============================================================
 
 def migrate_legacy_state():
-
-    legacy_lock = os.path.join(
+    legacy_dir = os.path.join(
         BASE_DIR,
         "state",
+    )
+
+    legacy_lock = os.path.join(
+        legacy_dir,
         "date_lock.txt",
     )
 
@@ -1021,19 +1510,16 @@ def migrate_legacy_state():
             exist_ok=True,
         )
 
-        legacy_dir = os.path.join(
-            BASE_DIR,
-            "state",
-        )
-
-        for name in (
+        legacy_files = (
             "domain-names.txt",
             "premium_domains.txt",
             "premium_domain_report.txt",
             "Ultimate_God_Leads.csv",
             "scanned_cache.txt",
             "filter_2.done",
-        ):
+        )
+
+        for name in legacy_files:
 
             src = os.path.join(
                 legacy_dir,
@@ -1059,7 +1545,6 @@ def migrate_legacy_state():
                     f"   ✅ Migrated {name}"
                 )
 
-        # Legacy categorized output migration.
         for name in (
             "Bawa_Categorized_Leads.partial.csv",
             "Bawa_Categorized_Leads.csv",
@@ -1083,56 +1568,61 @@ def migrate_legacy_state():
                 continue
 
             for row in rows:
+                row["_Source_Date"] = date_str
 
-                row["_Source_Date"] = (
-                    date_str
-                )
-
-            from ai_queue_manager import write_csv_atomic
-
-            canonical_rows, canonical_fields = (
-                load_csv(
-                    CANONICAL_FILE
-                )
+            canonical_rows, canonical_fields = load_csv(
+                CANONICAL_FILE
             )
 
-            by_domain = {
-                normalize_domain(
-                    r.get("Domain", "")
-                ): r
-                for r in canonical_rows
-                if normalize_domain(
-                    r.get("Domain", "")
+            by_domain = {}
+
+            for row in canonical_rows:
+
+                domain = normalize_domain(
+                    row.get(
+                        "Domain",
+                        "",
+                    )
                 )
-            }
+
+                if domain:
+                    row["Domain"] = domain
+                    by_domain[domain] = row
 
             for row in rows:
 
                 domain = normalize_domain(
-                    row.get("Domain", "")
+                    row.get(
+                        "Domain",
+                        "",
+                    )
                 )
 
-                if domain:
+                if not domain:
+                    continue
 
-                    row["Domain"] = domain
+                row["Domain"] = domain
 
-                    by_domain.setdefault(
-                        domain,
-                        row,
-                    )
+                if domain not in by_domain:
+                    by_domain[domain] = row
 
             ordered = list(
                 canonical_fields
             )
 
-            for field in fields + [
-                "_Source_Date"
-            ]:
+            for field in (
+                fields
+                + ["_Source_Date"]
+            ):
 
                 if field not in ordered:
                     ordered.append(
                         field
                     )
+
+            from ai_queue_manager import (
+                write_csv_atomic,
+            )
 
             write_csv_atomic(
                 CANONICAL_FILE,
@@ -1143,11 +1633,11 @@ def migrate_legacy_state():
             )
 
             log(
-                f"   ✅ Migrated legacy AI "
-                f"output from {name}: "
-                f"{len(rows):,} rows"
+                f"   ✅ Migrated legacy AI output "
+                f"from {name}: {len(rows):,} rows"
             )
 
+        # Remove migrated legacy temporary files.
         for name in (
             "Bawa_Categorized_Leads.partial.csv",
             "Bawa_Categorized_Leads.csv",
@@ -1172,15 +1662,15 @@ def migrate_legacy_state():
                 pass
 
         log(
-            f"✅ Legacy state migration complete "
-            f"for {date_str}."
+            f"✅ Legacy state migration "
+            f"complete for {date_str}."
         )
 
     except Exception as exc:
 
         log(
-            f"⚠️ Legacy migration encountered "
-            f"an error: {exc}"
+            f"⚠️ Legacy migration "
+            f"encountered an error: {exc}"
         )
 
 
@@ -1188,8 +1678,9 @@ def migrate_legacy_state():
 # GROQ WORKER
 # ============================================================
 
-def run_groq_worker(run_start):
-
+def run_groq_worker(
+    run_start,
+):
     if not can_start_stage(
         run_start,
         "Groq AI worker",
@@ -1208,8 +1699,8 @@ def run_groq_worker(run_start):
     if not claim:
 
         log(
-            "ℹ️ No currently unclaimed AI "
-            "leads for Groq."
+            "ℹ️ No currently unclaimed "
+            "AI leads for Groq."
         )
 
         return "NO_WORK"
@@ -1234,22 +1725,22 @@ def run_groq_worker(run_start):
 
     env = os.environ.copy()
 
-    env["CATEGORIZER_INPUT_FILE"] = (
-        os.path.basename(
-            input_file
-        )
+    env[
+        "CATEGORIZER_INPUT_FILE"
+    ] = os.path.basename(
+        input_file
     )
 
-    env["CATEGORIZER_OUTPUT_FILE"] = (
-        os.path.basename(
-            output_file
-        )
+    env[
+        "CATEGORIZER_OUTPUT_FILE"
+    ] = os.path.basename(
+        output_file
     )
 
-    env["CATEGORIZER_PARTIAL_FILE"] = (
-        os.path.basename(
-            partial_file
-        )
+    env[
+        "CATEGORIZER_PARTIAL_FILE"
+    ] = os.path.basename(
+        partial_file
     )
 
     env.setdefault(
@@ -1287,8 +1778,8 @@ def run_groq_worker(run_start):
 
         log(
             f"⚠️ Groq worker exited "
-            f"{exc.returncode}; publishing "
-            f"partial results if any."
+            f"{exc.returncode}; "
+            f"publishing partial results if any."
         )
 
     except OSError as exc:
@@ -1310,9 +1801,11 @@ def run_groq_worker(run_start):
 
     try:
 
-        count = publish_result_and_release(
-            claim,
-            produced,
+        count = (
+            publish_result_and_release(
+                claim,
+                produced,
+            )
         )
 
         log(
@@ -1325,8 +1818,8 @@ def run_groq_worker(run_start):
 
         log(
             f"❌ Could not publish/release "
-            f"Groq claim {claim['claim_id']}: "
-            f"{exc}"
+            f"Groq claim "
+            f"{claim['claim_id']}: {exc}"
         )
 
         return "ERROR"
@@ -1343,17 +1836,17 @@ def run_groq_worker(run_start):
 # ============================================================
 
 def main():
-
     log(
         "============================================================"
     )
 
     log(
-        "BAWA MASTER CONTROLLER v4.1 ONLINE"
+        "BAWA MASTER CONTROLLER v4.2 ONLINE"
     )
 
     log(
-        "X-Ray Completion Recovery + Global AI Queue + Groq Worker"
+        "Durable X-Ray Checkpoint + "
+        "Completion Recovery + Global AI Queue"
     )
 
     log(
@@ -1365,13 +1858,11 @@ def main():
     # --------------------------------------------------------
     # LEGACY MIGRATION
     # --------------------------------------------------------
-
     migrate_legacy_state()
 
     # --------------------------------------------------------
-    # INTERNET
+    # NETWORK
     # --------------------------------------------------------
-
     if not check_internet():
 
         log(
@@ -1382,12 +1873,13 @@ def main():
         return
 
     # --------------------------------------------------------
-    # RECOVER / MERGE EXISTING AI RESULTS
+    # QUEUE HOUSEKEEPING
     # --------------------------------------------------------
-
     cleanup_expired_claims()
 
-    merged, total = merge_result_shards()
+    merged, total = (
+        merge_result_shards()
+    )
 
     if merged:
 
@@ -1397,9 +1889,8 @@ def main():
         )
 
     # --------------------------------------------------------
-    # PHASE 1: RAW SYNC
+    # RAW WHOIS SYNC
     # --------------------------------------------------------
-
     raw_result = run_raw_sync(
         run_start
     )
@@ -1412,9 +1903,8 @@ def main():
         )
 
     # --------------------------------------------------------
-    # PHASE 2: ONE X-RAY DATE
+    # ONE X-RAY DATE
     # --------------------------------------------------------
-
     xray_result = run_one_xray_date(
         run_start
     )
@@ -1422,42 +1912,45 @@ def main():
     if xray_result in {
         "PAUSED",
         "ERROR",
+        "CHECKPOINT_FAILED",
     }:
 
         log(
             f"⏸️ X-Ray returned "
             f"{xray_result}; "
-            f"no same-run retry."
-        )
-
-    elif xray_result == "SUCCESS":
-
-        log(
-            "✅ X-Ray date is ready "
-            "for the global AI queue."
-        )
-
-    elif xray_result == "NO_DATE":
-
-        log(
-            "ℹ️ No X-Ray date currently "
-            "requires processing."
+            f"AI worker will not force a retry."
         )
 
     # --------------------------------------------------------
-    # PHASE 3: GLOBAL GROQ AI QUEUE
+    # GLOBAL GROQ WORKER
     # --------------------------------------------------------
-
+    #
+    # The worker starts only AFTER X-Ray state has been
+    # durably checkpointed.
+    #
     while (
-        remaining_budget(run_start)
+        remaining_budget(
+            run_start
+        )
         >= MIN_STAGE_SECONDS
     ):
 
         before = time.time()
 
-        result = run_groq_worker(
-            run_start
-        )
+        try:
+
+            result = run_groq_worker(
+                run_start
+            )
+
+        except Exception as exc:
+
+            log(
+                f"❌ Groq worker controller error: "
+                f"{exc}"
+            )
+
+            break
 
         after = time.time()
 
@@ -1472,26 +1965,33 @@ def main():
             break
 
         if (
-            remaining_budget(run_start)
+            remaining_budget(
+                run_start
+            )
             < MIN_STAGE_SECONDS
         ):
             break
 
     # --------------------------------------------------------
-    # PHASE 4: MERGE AI RESULT SHARDS
+    # MERGE AI RESULTS
     # --------------------------------------------------------
+    merged, total = (
+        merge_result_shards()
+    )
 
-    merge_result_shards()
+    if merged:
 
-    # --------------------------------------------------------
-    # PHASE 5: ARCHIVE COMPLETED DATES
-    # --------------------------------------------------------
-
-    archived = archive_ready_dates(
-        os.path.join(
-            BASE_DIR,
-            "master_control_room",
+        log(
+            f"✅ Final merge this run: "
+            f"{merged:,} new AI results; "
+            f"canonical total={total:,}."
         )
+
+    # --------------------------------------------------------
+    # ARCHIVE
+    # --------------------------------------------------------
+    archived = archive_ready_dates(
+        MASTER_CONTROL_ROOM_DIR
     )
 
     if archived:
@@ -1501,12 +2001,27 @@ def main():
             f"{archived:,} completed date(s)."
         )
 
+    # --------------------------------------------------------
+    # FINAL DURABILITY CHECKPOINT
+    # --------------------------------------------------------
+    #
+    # X-Ray state is already independently persisted.
+    # This final checkpoint also captures:
+    #
+    #   daily_domains
+    #   processing_queue
+    #   generated master_control_room output
+    #
+    persist_xray_state(
+        "controller final checkpoint"
+    )
+
     log(
         "============================================================"
     )
 
     log(
-        "Master Controller v4.1 run complete. Exiting."
+        "Master Controller v4.2 run complete. Exiting."
     )
 
     log(
